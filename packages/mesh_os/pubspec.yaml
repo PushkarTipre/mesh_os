@@ -1,0 +1,23 @@
+name: mesh_os
+description: >
+  Public MeshOS SDK: glues mesh_core (identity, crypto, routing) together
+  with platform storage and transports, and exposes the app-facing API.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.4
+
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mesh_core:
+    path: ../mesh_core
+  flutter_secure_storage: ^9.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0

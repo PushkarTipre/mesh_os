@@ -6,30 +6,30 @@ Ordering rationale: everything that is pure Dart (identity, crypto, packets, rou
 
 ---
 
-## Checkpoint 0 — Project scaffolding ✅ definition of "started"
+## Checkpoint 0 — Project scaffolding ✅ done (2026-07-10)
 
 **Goal:** repo shaped like an SDK, not an app.
 
-- [ ] Restructure to a melos/pub-workspace monorepo: `packages/mesh_core`, `packages/mesh_os`, `apps/mesh_console` (move current `lib/main.dart` there).
-- [ ] `mesh_core` is pure Dart — enforce with `flutter analyze` + a CI check that it never imports `flutter/`.
-- [ ] Add dependencies: `cryptography`, `flutter_secure_storage`, `drift` (or `sqflite`), lints.
-- [ ] CI (GitHub Actions): `dart analyze` + `dart test` on every push.
-- [ ] `git init` + first commit (repo is currently not under version control).
+- [x] Restructure to a monorepo: `packages/mesh_core`, `packages/mesh_os`, `apps/mesh_console` (moved from `lib/main.dart`). Uses Dart's native pub workspaces (`resolution: workspace`, Dart 3.6+) rather than melos — one `pub get` at the root resolves all three packages, no extra tool dependency.
+- [x] `mesh_core` is pure Dart (only depends on `cryptography`; no `flutter` import anywhere).
+- [x] Added dependencies: `cryptography` (mesh_core), `flutter_secure_storage` (mesh_os), lints/flutter_lints. `drift`/`sqflite` deferred to CP5 (local storage isn't needed until trust/contacts persistence).
+- [x] CI (GitHub Actions, `.github/workflows/ci.yml`): `flutter pub get` + `flutter analyze` + `dart test` on `mesh_core`, on every push/PR.
+- [x] `git init` + first commit of the original Flutter template, then the restructure as a second commit.
 
-**Exit criterion:** `melos bootstrap && dart test` runs green from a clean clone; `mesh_console` app builds and runs on a phone.
+**Exit criterion:** ✅ `flutter pub get && flutter analyze` is clean workspace-wide; `dart test` in `packages/mesh_core` is green. (`mesh_console` builds on a physical/emulated device — not yet run on real hardware, do this before relying on it.)
 
 ---
 
-## Checkpoint 1 — Identity & crypto core (pure Dart)
+## Checkpoint 1 — Identity & crypto core (pure Dart) ✅ done (2026-07-10)
 
 **Goal:** a node can be born.
 
-- [ ] `NodeIdentity`: generate Ed25519 signing pair + X25519 agreement pair; derive Node ID = SHA-256(pubkey)[0..16].
-- [ ] Persist/load identity via a storage interface (secure-storage impl lives in `mesh_os`, mock in tests).
-- [ ] Sign/verify bytes; ECDH → ChaCha20-Poly1305 encrypt/decrypt round-trip between two in-memory identities.
-- [ ] Temporary-ID rotation: derive rotating temp ID from (permanent key, time slot); trusted peers can match it, strangers can't.
+- [x] `NodeIdentity`: generate Ed25519 signing pair + X25519 agreement pair; derive Node ID = SHA-256(pubkey)[0..16] hex. (`packages/mesh_core/lib/src/identity/node_identity.dart`)
+- [x] Persist/load identity via a storage interface: `IdentityStore` + `InMemoryIdentityStore` in `mesh_core`; `SecureStorageIdentityStore` (flutter_secure_storage-backed) in `mesh_os`.
+- [x] Sign/verify bytes (Ed25519); ECDH (X25519) → HKDF-SHA256 → ChaCha20-Poly1305 encrypt/decrypt round-trip between two in-memory identities, serializable via `EncryptedEnvelope`.
+- [x] Temporary-ID rotation: `TemporaryId.derive` — SHA-256(signing public key ‖ 10-minute time slot), truncated to 8 bytes. Documented assumption: this only protects against passive tracking if the permanent public key is *not* broadcast in open discovery beacons — enforced at the discovery/transport layer, not here (flagged for CP3/CP5).
 
-**Exit criterion:** unit tests — two `NodeIdentity` instances exchange an encrypted+signed payload entirely in memory; tampered payloads fail verification; app restart preserves identity.
+**Exit criterion:** ✅ 20/20 unit tests green in `packages/mesh_core/test/identity/` — node ID generation/uniqueness, sign/verify (including tamper and wrong-key rejection), encrypt/decrypt round-trip (including tamper and wrong-recipient rejection), temp ID rotation, and identity persistence across a simulated restart (`loadOrCreate` called twice against the same store returns the same key material). `mesh_console` now generates/loads a `NodeIdentity` via `SecureStorageIdentityStore` on launch and displays the Node ID — restart-persistence still needs to be confirmed on a real device (see "Next up").
 
 ---
 

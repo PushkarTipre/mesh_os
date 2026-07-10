@@ -1,19 +1,10 @@
-name: mesh_os
-description: "A new Flutter project."
-publish_to: 'none'
-version: 0.1.0
+name: mesh_os_workspace
+publish_to: none
 
 environment:
   sdk: ^3.10.4
 
-dependencies:
-  flutter:
-    sdk: flutter
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^6.0.0
-
-flutter:
-  uses-material-design: true
+workspace:
+  - packages/mesh_core
+  - packages/mesh_os
+  - apps/mesh_console
