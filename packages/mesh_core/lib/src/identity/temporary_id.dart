@@ -34,8 +34,9 @@ class TemporaryId {
   }
 
   /// Derives the temporary ID for the signing public key bytes at [at]
-  /// (defaults to now), as a lowercase hex string.
-  static Future<String> derive({
+  /// (defaults to now), as raw bytes -- this is the wire representation
+  /// used in packet headers (see `MeshPacket`).
+  static Future<Uint8List> deriveBytes({
     required List<int> signingPublicKeyBytes,
     DateTime? at,
   }) async {
@@ -45,7 +46,20 @@ class TemporaryId {
       ...signingPublicKeyBytes,
       ...slotBytes.buffer.asUint8List(),
     ]);
-    final truncated = digest.bytes.sublist(0, lengthBytes);
-    return truncated.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return Uint8List.fromList(digest.bytes.sublist(0, lengthBytes));
+  }
+
+  /// Derives the temporary ID for the signing public key bytes at [at]
+  /// (defaults to now), as a lowercase hex string -- convenient for
+  /// display/logging.
+  static Future<String> derive({
+    required List<int> signingPublicKeyBytes,
+    DateTime? at,
+  }) async {
+    final bytes = await deriveBytes(
+      signingPublicKeyBytes: signingPublicKeyBytes,
+      at: at,
+    );
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }
 }

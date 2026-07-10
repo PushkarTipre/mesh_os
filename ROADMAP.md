@@ -33,17 +33,19 @@ Ordering rationale: everything that is pure Dart (identity, crypto, packets, rou
 
 ---
 
-## Checkpoint 2 — Packet layer (pure Dart)
+## Checkpoint 2 — Packet layer (pure Dart) ✅ done (2026-07-10)
 
 **Goal:** the wire format exists and is bulletproof.
 
-- [ ] Binary codec for the packet header (version, type, id, timestamp, temp src/dst, TTL, hops, priority) + payload + signature + checksum.
-- [ ] All 7 packet types (`discovery`, `data`, `broadcast`, `ack`, `sync`, `file`, `heartbeat`).
-- [ ] Duplicate-detection cache (packet-ID LRU with expiry).
-- [ ] Fragmentation/reassembly layer (MTU-parameterized) — written here, exercised for real in CP3.
-- [ ] Fuzz/property tests: encode→decode round-trips; corrupt bytes never crash the decoder, they return errors.
+- [x] Binary codec for the packet header (version, type, id, timestamp, temp src/dst, TTL, hops, priority) + payload + signature + checksum. (`packages/mesh_core/lib/src/packet/mesh_packet.dart`) 105-byte fixed header, payload is everything after it (no length prefix needed or possible to get wrong).
+- [x] All 7 packet types (`discovery`, `data`, `broadcast`, `ack`, `sync`, `file`, `heartbeat`). (`packet_type.dart`)
+- [x] Duplicate-detection cache (packet-ID LRU with expiry). (`packet_dedup_cache.dart`) — expiry-based eviction is O(k) in evicted entries, not a full scan, since insertion order tracks chronological order.
+- [x] Fragmentation/reassembly layer (MTU-parameterized). (`fragment.dart`, `fragmenter.dart`, `reassembler.dart`) Tolerates out-of-order and duplicate fragment delivery; abandons incomplete messages after inactivity. Exercised against synthetic MTU sizes here — plugged into a real transport's negotiated MTU in CP3.
+- [x] Fuzz/property tests: encode→decode round-trips; corrupt bytes never crash the decoder, they return errors.
 
-**Exit criterion:** `dart test` green including a fuzz suite (random payloads, random corruption, truncated buffers).
+**Design decision worth flagging:** the Ed25519 signature covers only the fields the *origin sender* sets (version, type, packetId, timestamp, tempSourceId, tempDestId, priority, payload) and deliberately excludes `ttl`/`hopCount`. Relays don't hold the sender's private key, so they can decrement TTL and increment hop count in place without invalidating the signature — `MeshPacket.forwarded()` does this and the signature still verifies after any number of hops (tested explicitly). The CRC-32 `checksum` is a separate, unsigned, per-hop transmission-integrity check that gets recomputed fresh by every relay in `toBytes()`.
+
+**Exit criterion:** ✅ `dart test` green — 54/54 tests in `packages/mesh_core`, including: round-trip for all 7 packet types plus empty/large payloads; TTL/hop-count mutation via `forwarded()` with signature surviving relay; signature correctly rejecting a wrong signer or a tampered payload; the dedup cache's expiry and capacity eviction; fragmentation/reassembly with out-of-order and duplicate delivery and incomplete-message eviction; and a fuzz suite that truncates a valid packet at every possible length, applies random single- and multi-byte corruption (500 trials each), and feeds 1000 random-length random-content buffers — asserting the decoder only ever throws `PacketDecodeException`, never a raw crash.
 
 ---
 

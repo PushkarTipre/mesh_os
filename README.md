@@ -17,7 +17,7 @@ mesh.messages.listen((msg) => ...);
 
 ## Status
 
-🚧 Early development — **Checkpoints 0 and 1 done** (project scaffolding; identity & crypto core). Next up: Checkpoint 2 (packet layer). **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
+🚧 Early development — **Checkpoints 0–2 done** (project scaffolding; identity & crypto core; packet layer). Next up: Checkpoint 3 (Nearby Connections transport — first checkpoint that needs real Android hardware). **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
 
 ## Repo layout
 
@@ -33,8 +33,9 @@ Root `pubspec.yaml` is a Dart pub workspace — `flutter pub get` once at the re
 
 ```
 flutter pub get                          # from repo root
-(cd packages/mesh_core && dart test)     # 20 unit tests: identity, crypto, temp-ID rotation, persistence
+(cd packages/mesh_core && dart test)     # 54 unit tests: identity/crypto (CP1) + packet layer (CP2)
 flutter analyze                          # whole workspace
+(cd packages/mesh_core && dart run example/identity_demo.dart)  # see the crypto core in action
 ```
 
 `apps/mesh_console` currently shows the device's generated Node ID on launch, persisted via platform secure storage — force-quitting and reopening the app should show the same ID.

@@ -160,6 +160,13 @@ class NodeIdentity {
         at: at,
       );
 
+  /// Raw-byte form of [temporaryId] -- the wire representation used in
+  /// packet headers (see `MeshPacket`).
+  Future<Uint8List> temporaryIdBytes({DateTime? at}) => TemporaryId.deriveBytes(
+        signingPublicKeyBytes: signingPublicKey.bytes,
+        at: at,
+      );
+
   /// Serializes this identity, including private key material, for
   /// storage via an [IdentityStore]. The caller is responsible for storing
   /// the result somewhere secure.
