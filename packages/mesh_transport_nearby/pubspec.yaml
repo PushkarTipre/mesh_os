@@ -1,0 +1,25 @@
+name: mesh_transport_nearby
+description: >
+  MeshOS Transport implementation backed by Google Nearby Connections
+  (Android). Thin platform-channel adapter -- protocol logic (handshake,
+  encryption, routing) lives in mesh_core and is transport-agnostic.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.4
+
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mesh_core:
+    path: ../mesh_core
+  nearby_connections: ^3.3.0
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0

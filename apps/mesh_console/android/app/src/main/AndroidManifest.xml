@@ -1,4 +1,34 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Nearby Connections transport (mesh_transport_nearby, CP3) --
+         ARCHITECTURE.md §11. Runtime permission requests are handled by
+         NearbyPermissions; these declarations are what make those
+         requests possible at all. -->
+
+    <!-- Android 12+ (API 31+) Bluetooth permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Pre-Android 12 Bluetooth permissions, superseded above but still
+         needed on older devices -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+
+    <!-- Nearby Connections relies on BLE scan results that Android still
+         treats as location-adjacent, even on newer API levels -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Android 13+ (API 33+) -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+
+    <!-- Nearby Connections upgrades connections to Wi-Fi Direct/hotspot
+         for bandwidth -- local networking only, no internet uplink
+         required (MeshOS is offline-first, ARCHITECTURE.md §2) -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:label="mesh_os"
         android:name="${applicationName}"

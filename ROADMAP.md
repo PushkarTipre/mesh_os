@@ -49,19 +49,21 @@ Ordering rationale: everything that is pure Dart (identity, crypto, packets, rou
 
 ---
 
-## Checkpoint 3 — Nearby Connections transport, single hop ⚠️ highest risk so far
+## Checkpoint 3 — Nearby Connections transport, single hop ⚠️ code done, on-device demo still needed
 
 **Goal:** two physical phones exchange raw MeshOS packets with the screen on.
 
 Android-only scope means transport v1 is **Google Nearby Connections**, not BLE (see ARCHITECTURE §11) — it handles discovery/connection for us and upgrades to Wi-Fi for bandwidth, cutting the riskiest part of the original plan.
 
-- [ ] `Transport` interface in `mesh_core` (advertise, discover, connect, send bytes, byte stream in) — transport-agnostic so BLE can slot in later (CP8).
-- [ ] `mesh_transport_nearby`: wrap the `nearby_connections` plugin (P2P_CLUSTER strategy) — time-boxed spike first to confirm plugin quality; fallback = own platform channels over the native Nearby API.
-- [ ] Fragmentation from CP2 wired in for packets above the `BYTES` payload cap (~32 KB).
-- [ ] Android runtime-permission flow (`BLUETOOTH_SCAN/ADVERTISE/CONNECT`, `NEARBY_WIFI_DEVICES`, location on older APIs).
-- [ ] `mesh_console` debug screen: nearby devices list, connect/disconnect events, send-test-packet button, packet log.
+- [x] `Transport` interface in `mesh_core` (advertise, discover, connect, send bytes, byte stream in). (`packages/mesh_core/lib/src/transport/transport.dart`) Transport-agnostic so BLE can slot in later (CP8).
+- [x] `mesh_transport_nearby`: wraps the `nearby_connections` plugin (P2P_CLUSTER strategy). (`packages/mesh_transport_nearby/`) Its real API was read directly from the installed package source (not from memory) before writing the adapter, to avoid guessing wrong on callback shapes.
+- [x] Fragmentation from CP2 wired in for packets above `Transport.maxPayloadSize` — every send is prefixed with a 1-byte envelope marker (whole-packet vs. fragment); tested end-to-end through `MeshLink` with an artificially tiny MTU.
+- [x] Android runtime-permission flow (`BLUETOOTH_SCAN/ADVERTISE/CONNECT`, `NEARBY_WIFI_DEVICES`, location) via `NearbyPermissions` + manifest entries in `mesh_console`.
+- [x] `mesh_console` debug screen: nearby devices list, connect/accept/disconnect, per-peer send-test-packet button, scrolling packet log.
 
-**Exit criterion (demo):** two Android phones with no internet (Wi-Fi with no uplink or airplane mode + BT/Wi-Fi radios on) discover each other and exchange signed, encrypted packets; packet log shows verify+decrypt success. **This demo is the project's biggest de-risking moment.**
+**Design choice worth flagging:** encrypting a packet requires the recipient's public key, which CP3 doesn't have a trust store for yet (that's CP5). So the transport-agnostic `MeshLink` (`packages/mesh_core/lib/src/session/mesh_link.dart`) implements a minimal, ephemeral, **self-certifying** handshake: on connect, both sides send a signed `discovery` packet whose payload *is* their public keys — a signature that verifies against its own embedded key is proof of private-key possession, no prior exchange needed. This is explicitly **not** the real discovery/trust protocol (ARCHITECTURE.md §7-9, landing in CP5); it's the minimum needed to prove the crypto stack works over a real transport. `MeshLink` only touches the abstract `Transport` interface, so it's fully unit-tested (handshake, verify, encrypt/decrypt, fragmentation, tamper-drop, disconnect/reconnect) against a `FakeTransport` test double with zero hardware — 60/60 tests green in `packages/mesh_core`. `NearbyTransport` itself is a thin, deliberately dumb platform-channel wrapper with no protocol logic of its own, which confines the untestable-without-hardware surface to as little code as possible.
+
+**Exit criterion (demo):** two Android phones with no internet (Wi-Fi with no uplink or airplane mode + BT/Wi-Fi radios on) discover each other and exchange signed, encrypted packets; packet log shows verify+decrypt success. **This demo is the project's biggest de-risking moment — and it's the one part of this checkpoint that hasn't been run yet.** Nearby Connections has no emulator support, so this needs two real Android phones. See README.md for how to run it.
 
 ---
 
@@ -69,8 +71,8 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 **Goal:** the public API works end-to-end for one hop.
 
-- [ ] `MeshOS` facade: `initialize()`, `start()`, `send()`, `messages`, `devices`.
-- [ ] Session establishment: discovery handshake (temp ID, pubkey, version, transports) → ECDH session.
+- [ ] `MeshOS` facade: `initialize()`, `start()`, `send()`, `messages`, `devices`. Wraps CP3's `MeshLink` + `NearbyTransport` rather than reimplementing them.
+- [ ] Replace CP3's minimal self-certifying handshake with the real discovery protocol (temp ID, pubkey, version, transports) — decide here whether/how permanent public keys stay off the open beacon (ARCHITECTURE.md §7-9 territory that CP3 deliberately deferred).
 - [ ] ACK + retry + delivery status for direct messages.
 - [ ] Minimal chat UI in `mesh_console` (this is a test harness, not a product).
 
