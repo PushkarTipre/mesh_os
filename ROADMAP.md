@@ -96,16 +96,20 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 ---
 
-## Checkpoint 6 — Multi-hop routing + store-and-forward (= PDF Phase 3)
+## Checkpoint 6 — Multi-hop routing + store-and-forward (= PDF Phase 3) ✅ code done, on-device demo still needed
 
 **Goal:** messages travel through strangers. This is the moment it becomes a *mesh*.
 
-- [ ] Flooding router: TTL decrement, hop count, dedup cache, per-peer rate limiting (basic DoS hygiene).
-- [ ] Relay policy enforcement (user relay settings from ARCHITECTURE §4).
-- [ ] Store-and-forward: pending-packet store with expiry; forward on encounter.
-- [ ] End-to-end ACK propagated back across hops.
+- [x] Flooding router: TTL decrement, hop count, dedup cache, per-peer rate limiting (basic DoS hygiene). (`MeshLink._relayPacket`/`_floodOrStore`, `packages/mesh_core/lib/src/session/mesh_link.dart`)
+- [x] Relay policy enforcement (user relay settings from ARCHITECTURE §4) — `RelayPolicy`: `everything` / `trustedContactsOnly` / `disabled`. Battery/charging/Wi-Fi-gated policy from the original design is deferred (not core routing logic).
+- [x] Store-and-forward: pending-packet store with expiry; forward on encounter, plus a periodic sweep so a packet can still expire (and its `sendToNode` caller still gets `failed`) even for a node with zero further connectivity. In-memory only for now — doesn't survive an app restart; see ARCHITECTURE.md §7's noted limitation.
+- [x] End-to-end ACK propagated back across hops (`MeshLink.sendToNode`) — resolves whenever the destination's ack eventually arrives, however many hops away that turns out to be, or fails once the packet expires unacked.
 
-**Exit criterion (demo):** three phones A–B–C where A and C are out of range of each other: A's message reaches C through B, and B (an "Unknown" relay) can be shown to have seen only encrypted bytes. Then: turn C off, send from A, walk B near C later → delivered.
+**The one genuinely hard design problem this checkpoint had to solve:** rotating temp IDs (10-minute rotation, built for anti-tracking) are incompatible with store-and-forward across meaningful time gaps — an address computed at send time can't match a destination's temp ID hours later. Solved with a third, *stable* identifier (`NodeIdentity.routingAddress`) used only for multi-hop packet addressing, documented in ARCHITECTURE.md §3 as a deliberate, narrower privacy trade-off scoped to routed traffic specifically.
+
+**A real bug the test suite caught before this ever reached a device:** the first implementation distinguished "direct message" from "routed packet passing through me" by whether the packet's signature verified against the immediate sender's own session key. That's wrong for the *first hop* specifically — a packet A routes toward C via B is still genuinely signed by A, and A is B's real direct peer, so it always passed that check, causing B to try to decrypt a message meant for C and silently drop it instead of relaying. Fixed by branching on `tempDestId` (the `broadcastDestination` sentinel means direct; anything else means routed) instead of on whether the signature happens to verify. Caught immediately by the multi-hop test suite (`packages/mesh_core/test/routing/multi_hop_test.dart`) rather than during on-device testing.
+
+**Exit criterion (demo):** three phones A–B–C where A and C are out of range of each other: A's message reaches C through B, and B (an "Unknown" relay) can be shown to have seen only encrypted bytes. Then: turn C off, send from A, walk B near C later → delivered. **Not yet run on real hardware** — the entire scenario above, plus store-and-forward, end-to-end ack, blocked-sender-dropped, relay policy, and rate limiting, is proven in `packages/mesh_core`'s test suite (92 tests) against a simulated 3-node network, but this is the first checkpoint whose exit criterion needs *three* physical phones, not two. See README.md.
 
 ---
 

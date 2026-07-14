@@ -12,6 +12,7 @@ import '../packet/packet_decode_exception.dart';
 import '../packet/packet_dedup_cache.dart';
 import '../packet/packet_type.dart';
 import '../packet/reassembler.dart';
+import '../routing/relay_policy.dart';
 import '../transport/transport.dart';
 import '../trust/contact.dart';
 import '../trust/trust_level.dart';
@@ -29,21 +30,41 @@ const int _fragmentMarker = 0x01;
 String _bytesToHex(List<int> bytes) =>
     bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
-/// A message received from a peer, already signature-verified and
-/// decrypted.
-class InboundMessage {
-  const InboundMessage({required this.remoteId, required this.plaintext});
-
-  final String remoteId;
-  final Uint8List plaintext;
+bool _bytesEqual(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
 }
 
-/// Outcome of a [MeshLink.sendData] call.
+/// A message received from a peer, already signature-verified and
+/// decrypted -- whether it arrived directly or through one or more
+/// relays.
+class InboundMessage {
+  const InboundMessage({required this.senderNodeId, required this.plaintext, this.remoteId});
+
+  /// The sender's permanent, stable Node ID. Always populated, regardless
+  /// of hop count -- use this, not [remoteId], to identify who sent it.
+  final String senderNodeId;
+
+  final Uint8List plaintext;
+
+  /// The transport-level connection this arrived on: the sender
+  /// themselves for a direct message, or null for a routed one (there's
+  /// no live connection to the original sender in that case).
+  final String? remoteId;
+}
+
+/// Outcome of a [MeshLink.sendData]/[MeshLink.sendToNode] call.
 enum DeliveryStatus {
-  /// The peer's [PacketType.ack] for this message was received.
+  /// The peer's [PacketType.ack] for this message was received --
+  /// end-to-end for a routed send, hop-by-hop for a direct one.
   delivered,
 
-  /// Every retry was exhausted, or the peer disconnected, without an ack.
+  /// Every retry was exhausted (direct send), the peer disconnected, or
+  /// the packet expired from the local store-and-forward cache without
+  /// an ack ever arriving (routed send).
   failed,
 }
 
@@ -62,9 +83,17 @@ class _PendingSend {
   Timer? timer;
 }
 
+class _StoredRelayPacket {
+  _StoredRelayPacket({required this.packet, required this.storedAt});
+
+  final MeshPacket packet;
+  final DateTime storedAt;
+}
+
 /// Sits on top of any [Transport] and turns raw connected-peer bytes into
 /// verified, decrypted messages -- and the reverse for sending, with
-/// ACK-based delivery confirmation and retry. This is deliberately
+/// ACK-based delivery confirmation and retry, and multi-hop routing for
+/// destinations that aren't directly connected. This is deliberately
 /// transport-agnostic (it only touches the [Transport] interface), which
 /// is what makes it unit-testable against `FakeTransport` with no real
 /// radio.
@@ -79,18 +108,33 @@ class _PendingSend {
 /// (temporary IDs are what passive scanning reveals; permanent public
 /// keys are only revealed to peers you actually connect to).
 ///
-/// Reliability: a [PacketType.data] send is tracked until the receiver's
-/// [PacketType.ack] arrives, retrying on a timer up to `maxRetries` times
-/// before resolving [DeliveryStatus.failed]. Because a retry can cause the
-/// *same* data packet to arrive twice (e.g. the ack, not the data, was
-/// what got lost), incoming data packets are deduplicated by packet ID
-/// before being surfaced on [messages] -- the receiver still re-sends the
-/// ack either way, since that's what the sender is actually waiting on.
+/// Direct reliability: a [sendData] to a directly-connected peer is
+/// tracked until their [PacketType.ack] arrives, retrying on a timer up
+/// to `maxRetries` times before resolving [DeliveryStatus.failed].
+/// Because a retry can cause the *same* data packet to arrive twice (e.g.
+/// the ack, not the data, was what got lost), incoming data packets are
+/// deduplicated by packet ID before being surfaced on [messages] -- the
+/// receiver still re-sends the ack either way, since that's what the
+/// sender is actually waiting on.
+///
+/// Multi-hop routing (Checkpoint 6): a packet not authored by the direct
+/// peer that handed us its bytes is a routing candidate, distinguished
+/// from a direct message purely by whether it verifies against that
+/// peer's own session key -- if it doesn't, it's either addressed to us
+/// via a relay, or passing through us toward someone else. Routing uses
+/// [NodeIdentity.routingAddress] rather than the rotating temporary ID
+/// for addressing: see that field's doc comment for why -- in short,
+/// temp-ID rotation is incompatible with store-and-forward across
+/// meaningful time gaps. [sendToNode] is the routing-aware counterpart
+/// to [sendData]: it sends directly if a live session exists, and falls
+/// back to flooding + store-and-forward + an end-to-end ack otherwise.
 class MeshLink {
   MeshLink({
     required this.transport,
     required this.identity,
     TrustStore? trustStore,
+    this.relayPolicy = RelayPolicy.everything,
+    this.storeAndForwardExpiry = const Duration(hours: 24),
   }) : trustStore = trustStore ?? InMemoryTrustStore();
 
   final Transport transport;
@@ -102,15 +146,30 @@ class MeshLink {
   /// supply a persistent one (mesh_os's `DriftTrustStore`).
   final TrustStore trustStore;
 
+  final RelayPolicy relayPolicy;
+
+  /// How long a packet stays in the local store-and-forward cache,
+  /// waiting for a path to its destination, before [sendToNode] (for a
+  /// packet we originated) or ongoing relaying (for one we're carrying
+  /// for someone else) gives up on it.
+  final Duration storeAndForwardExpiry;
+
+  static const int _maxRelaysPerSourcePerWindow = 20;
+  static const Duration _relayRateWindow = Duration(minutes: 1);
+
   final Map<String, PeerSession> _sessions = {};
   final Map<String, Reassembler> _reassemblers = {};
   final Map<String, _PendingSend> _pendingSends = {};
+  final Map<String, _StoredRelayPacket> _relayStore = {};
+  final Map<String, Completer<DeliveryStatus>> _routedSendCompleters = {};
+  final Map<String, List<DateTime>> _relayRateLimitLog = {};
   final PacketDedupCache _dedupCache = PacketDedupCache();
   final StreamController<InboundMessage> _messages = StreamController.broadcast();
   final StreamController<String> _sessionEstablished = StreamController.broadcast();
 
   StreamSubscription<ConnectionEvent>? _connectionSub;
   StreamSubscription<DataEvent>? _dataSub;
+  Timer? _relayCleanupTimer;
 
   Stream<InboundMessage> get messages => _messages.stream;
 
@@ -128,6 +187,18 @@ class MeshLink {
   void start() {
     _connectionSub = transport.connectionEvents.listen(_onConnectionEvent);
     _dataSub = transport.dataEvents.listen(_onDataEvent);
+
+    // Store-and-forward entries are otherwise only swept lazily, on the
+    // next relay/flood/reconnect activity -- a node with no further
+    // connectivity at all would never re-check, leaving a sendToNode()
+    // caller waiting forever instead of eventually seeing `failed`. Sweep
+    // periodically too, at a cadence scaled to the expiry window.
+    final sweepInterval = Duration(
+      milliseconds: (storeAndForwardExpiry.inMilliseconds / 4)
+          .clamp(1000, const Duration(hours: 6).inMilliseconds)
+          .toInt(),
+    );
+    _relayCleanupTimer = Timer.periodic(sweepInterval, (_) => _evictExpiredRelayPackets());
   }
 
   Future<void> _onConnectionEvent(ConnectionEvent event) async {
@@ -138,6 +209,7 @@ class MeshLink {
       case ConnectionEventType.failed:
         _sessions.remove(event.remoteId);
         _reassemblers.remove(event.remoteId);
+        _relayRateLimitLog.remove(event.remoteId);
         _failPendingSendsFor(event.remoteId);
       case ConnectionEventType.incomingRequest:
         break;
@@ -220,6 +292,22 @@ class MeshLink {
     final session = _sessions[event.remoteId];
     if (session == null) return; // no key material for this peer yet
 
+    if (packet.type != PacketType.data && packet.type != PacketType.ack) return;
+
+    // A direct send/ack (sendData/_sendAck) always addresses tempDestId
+    // as broadcastDestination -- there's no routing address to check,
+    // the live transport connection *is* the addressing. Anything else
+    // in tempDestId means this packet is routed (Checkpoint 6): it might
+    // be signed by the very peer we're connected to (their own outbound
+    // packet, addressed past us to someone else -- the common first-hop
+    // case) or by someone further away entirely. Either way it can't be
+    // handled via this direct session's key, since the payload wasn't
+    // necessarily encrypted for *us* using *their* key.
+    if (!_bytesEqual(packet.tempDestId, MeshPacket.broadcastDestination)) {
+      await _handleRoutedPacket(event.remoteId, packet);
+      return;
+    }
+
     if (!await packet.verifySignature(session.signingPublicKey)) {
       return; // doesn't match this session's peer -- drop
     }
@@ -239,7 +327,7 @@ class MeshLink {
       case PacketType.ack:
         _handleAck(packet);
       default:
-        break;
+        break; // unreachable -- narrowed to data/ack above
     }
   }
 
@@ -289,6 +377,10 @@ class MeshLink {
       agreementPublicKey: agreementPublicKey,
     );
     _sessionEstablished.add(remoteId);
+
+    // A fresh connection is a fresh opportunity to get stuck packets
+    // moving again (ARCHITECTURE.md §7's "Charlie appears -> forward").
+    await _reattemptStoredRelays(remoteId);
   }
 
   Future<void> _handleData(String remoteId, MeshPacket packet, PeerSession session) async {
@@ -313,7 +405,11 @@ class MeshLink {
     }
 
     if (isNew) {
-      _messages.add(InboundMessage(remoteId: remoteId, plaintext: plaintext));
+      _messages.add(InboundMessage(
+        senderNodeId: session.nodeId,
+        plaintext: plaintext,
+        remoteId: remoteId,
+      ));
     }
 
     await _sendAck(remoteId, packet.packetId);
@@ -340,6 +436,228 @@ class MeshLink {
       pending.completer.complete(DeliveryStatus.delivered);
     }
   }
+
+  // ---------------------------------------------------------------------
+  // Multi-hop routing (Checkpoint 6)
+  // ---------------------------------------------------------------------
+
+  Future<void> _handleRoutedPacket(String fromRemoteId, MeshPacket packet) async {
+    final isNew = _dedupCache.checkAndRecord(packet.packetIdHex);
+    if (!isNew) return; // already relayed or processed this one
+
+    if (_bytesEqual(packet.tempDestId, identity.routingAddress)) {
+      final delivered = await _tryDeliverRouted(packet);
+      if (delivered) return;
+      // Routing-address collision is astronomically unlikely, but if we
+      // couldn't confidently claim it, fall through and treat it as a
+      // relay candidate rather than silently dropping a real message.
+    }
+
+    await _relayPacket(fromRemoteId, packet);
+  }
+
+  Future<bool> _tryDeliverRouted(MeshPacket packet) async {
+    final senderContact = await _resolveContactByRoutingAddress(packet.tempSourceId);
+    if (senderContact == null) return false;
+
+    // Consumed either way -- we recognize the sender, so this genuinely
+    // was addressed to us; a blocked sender's traffic is dropped, not
+    // relayed further.
+    if (senderContact.trustLevel == TrustLevel.blocked) return true;
+
+    if (!await packet.verifySignature(senderContact.signingPublicKey)) return false;
+
+    switch (packet.type) {
+      case PacketType.data:
+        await _handleRoutedData(packet, senderContact);
+        return true;
+      case PacketType.ack:
+        _handleRoutedAck(packet);
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  Future<Contact?> _resolveContactByRoutingAddress(Uint8List routingAddress) async {
+    for (final contact in await trustStore.listContacts()) {
+      final candidate = await NodeIdentity.routingAddressForSigningPublicKey(
+        contact.signingPublicKey,
+      );
+      if (_bytesEqual(candidate, routingAddress)) return contact;
+    }
+    return null;
+  }
+
+  Future<void> _handleRoutedData(MeshPacket packet, Contact senderContact) async {
+    final EncryptedEnvelope envelope;
+    try {
+      envelope = EncryptedEnvelope.fromBytes(packet.payload);
+    } on FormatException {
+      return;
+    }
+
+    final Uint8List plaintext;
+    try {
+      plaintext = await identity.decryptFrom(envelope, senderContact.agreementPublicKey);
+    } catch (_) {
+      return; // MAC failure / tampered payload -- drop
+    }
+
+    _messages.add(InboundMessage(senderNodeId: senderContact.nodeId, plaintext: plaintext));
+    await _sendRoutedAck(senderContact, packet.packetId);
+  }
+
+  Future<void> _sendRoutedAck(Contact recipient, Uint8List ackedPacketId) async {
+    final destRoutingAddress = await NodeIdentity.routingAddressForSigningPublicKey(
+      recipient.signingPublicKey,
+    );
+    final ackPacket = await MeshPacket.create(
+      signer: identity,
+      type: PacketType.ack,
+      tempSourceId: identity.routingAddress,
+      tempDestId: destRoutingAddress,
+      payload: ackedPacketId,
+    );
+    await _floodOrStore(ackPacket);
+  }
+
+  void _handleRoutedAck(MeshPacket ackPacket) {
+    if (ackPacket.payload.length != MeshPacket.packetIdLength) return;
+    final ackedPacketIdHex = _bytesToHex(ackPacket.payload);
+    final completer = _routedSendCompleters.remove(ackedPacketIdHex);
+    if (completer == null) return; // not ours, or already resolved
+    _relayStore.remove(ackedPacketIdHex);
+    if (!completer.isCompleted) {
+      completer.complete(DeliveryStatus.delivered);
+    }
+  }
+
+  Future<void> _relayPacket(String fromRemoteId, MeshPacket packet) async {
+    final forwarded = packet.forwarded();
+    if (forwarded == null) return; // ttl exhausted
+
+    if (!await _relayAllowed(fromRemoteId)) return;
+    if (!_recordRelayForRateLimit(fromRemoteId)) return;
+
+    await _floodOrStore(forwarded, excludeRemoteId: fromRemoteId);
+  }
+
+  Future<bool> _relayAllowed(String fromRemoteId) async {
+    switch (relayPolicy) {
+      case RelayPolicy.disabled:
+        return false;
+      case RelayPolicy.everything:
+        return true;
+      case RelayPolicy.trustedContactsOnly:
+        final session = _sessions[fromRemoteId];
+        if (session == null) return false;
+        return await trustStore.trustLevelFor(session.nodeId) == TrustLevel.trusted;
+    }
+  }
+
+  /// Basic DoS hygiene: caps how many packets we'll relay *on behalf of*
+  /// a single source peer within [_relayRateWindow] -- a hostile or
+  /// malfunctioning neighbor can't turn us into an unbounded flood
+  /// amplifier for their traffic.
+  bool _recordRelayForRateLimit(String fromRemoteId) {
+    final now = DateTime.now();
+    final log = _relayRateLimitLog.putIfAbsent(fromRemoteId, () => []);
+    log.removeWhere((t) => now.difference(t) > _relayRateWindow);
+    if (log.length >= _maxRelaysPerSourcePerWindow) return false;
+    log.add(now);
+    return true;
+  }
+
+  /// Stores [packet] for later opportunistic delivery (ARCHITECTURE.md
+  /// §7) and immediately floods it to every currently connected peer
+  /// except [excludeRemoteId] (typically whoever we just received it
+  /// from, if any).
+  Future<void> _floodOrStore(MeshPacket packet, {String? excludeRemoteId}) async {
+    _evictExpiredRelayPackets();
+    _relayStore[packet.packetIdHex] = _StoredRelayPacket(
+      packet: packet,
+      storedAt: DateTime.now().toUtc(),
+    );
+    final bytes = packet.toBytes();
+    for (final remoteId in _sessions.keys.toList()) {
+      if (remoteId == excludeRemoteId) continue;
+      await _sendBytes(remoteId, bytes);
+    }
+  }
+
+  Future<void> _reattemptStoredRelays(String remoteId) async {
+    _evictExpiredRelayPackets();
+    for (final stored in _relayStore.values.toList()) {
+      await _sendBytes(remoteId, stored.packet.toBytes());
+    }
+  }
+
+  void _evictExpiredRelayPackets() {
+    final now = DateTime.now().toUtc();
+    final expiredKeys = _relayStore.entries
+        .where((entry) => now.difference(entry.value.storedAt) > storeAndForwardExpiry)
+        .map((entry) => entry.key)
+        .toList();
+    for (final key in expiredKeys) {
+      _relayStore.remove(key);
+      final completer = _routedSendCompleters.remove(key);
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(DeliveryStatus.failed);
+      }
+    }
+  }
+
+  /// Sends [plaintext] to [nodeId], using a direct session if one exists,
+  /// or routing through relays (flooding + store-and-forward) otherwise.
+  /// Requires [nodeId] to already be a known contact -- encrypting for
+  /// them needs their public key, which this device only has on file if
+  /// they've met before, directly or via a relay. Throws [StateError]
+  /// otherwise, or if they're blocked.
+  ///
+  /// Unlike [sendData]'s bounded retry, a routed send has no fixed
+  /// timeout in the usual sense: it resolves [DeliveryStatus.delivered]
+  /// whenever the end-to-end ack eventually arrives (which could be much
+  /// later, if the destination isn't reachable yet), or
+  /// [DeliveryStatus.failed] once the packet expires from the local
+  /// store-and-forward cache ([storeAndForwardExpiry]) without one.
+  Future<DeliveryStatus> sendToNode(String nodeId, List<int> plaintext) async {
+    for (final session in _sessions.values) {
+      if (session.nodeId == nodeId) {
+        return sendData(session.remoteId, plaintext);
+      }
+    }
+
+    final contact = await trustStore.getContact(nodeId);
+    if (contact == null) {
+      throw StateError('MeshLink: no known contact with node $nodeId yet');
+    }
+    if (contact.trustLevel == TrustLevel.blocked) {
+      throw StateError('MeshLink: $nodeId is blocked');
+    }
+
+    final envelope = await identity.encryptFor(plaintext, contact.agreementPublicKey);
+    final destRoutingAddress = await NodeIdentity.routingAddressForSigningPublicKey(
+      contact.signingPublicKey,
+    );
+    final packet = await MeshPacket.create(
+      signer: identity,
+      type: PacketType.data,
+      tempSourceId: identity.routingAddress,
+      tempDestId: destRoutingAddress,
+      payload: envelope.toBytes(),
+    );
+
+    final completer = Completer<DeliveryStatus>();
+    _routedSendCompleters[packet.packetIdHex] = completer;
+    await _floodOrStore(packet);
+
+    return completer.future;
+  }
+
+  // ---------------------------------------------------------------------
+  // Direct (single-hop) reliable send -- Checkpoint 4
+  // ---------------------------------------------------------------------
 
   /// Encrypts and sends [plaintext] to [remoteId], retrying up to
   /// [maxRetries] times (every [retryInterval]) until the peer's ack
@@ -425,6 +743,7 @@ class MeshLink {
   Future<void> dispose() async {
     await _connectionSub?.cancel();
     await _dataSub?.cancel();
+    _relayCleanupTimer?.cancel();
     for (final pending in _pendingSends.values) {
       pending.timer?.cancel();
       if (!pending.completer.isCompleted) {
@@ -432,6 +751,13 @@ class MeshLink {
       }
     }
     _pendingSends.clear();
+    for (final completer in _routedSendCompleters.values) {
+      if (!completer.isCompleted) {
+        completer.complete(DeliveryStatus.failed);
+      }
+    }
+    _routedSendCompleters.clear();
+    _relayStore.clear();
     await _messages.close();
     await _sessionEstablished.close();
   }

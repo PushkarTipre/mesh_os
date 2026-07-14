@@ -13,6 +13,8 @@ export 'src/packet/packet_priority.dart';
 export 'src/packet/packet_type.dart';
 export 'src/packet/reassembler.dart';
 
+export 'src/routing/relay_policy.dart';
+
 export 'src/session/mesh_link.dart';
 export 'src/session/peer_session.dart';
 

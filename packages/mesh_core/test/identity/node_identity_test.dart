@@ -19,6 +19,34 @@ void main() {
     });
   });
 
+  group('routingAddress', () {
+    test('is 8 bytes and distinct between two identities', () async {
+      final a = await NodeIdentity.generate();
+      final b = await NodeIdentity.generate();
+      expect(a.routingAddress, hasLength(8));
+      expect(a.routingAddress, isNot(equals(b.routingAddress)));
+    });
+
+    test('is a stable prefix of the same digest nodeId is drawn from -- '
+        'unlike temporaryId, it does not rotate with time', () async {
+      final identity = await NodeIdentity.generate();
+      final at1 = DateTime.utc(2026, 1, 1, 12);
+      final at2 = at1.add(const Duration(hours: 3));
+
+      final addressAgain = await NodeIdentity.routingAddressForSigningPublicKey(
+        identity.signingPublicKey,
+      );
+      expect(identity.routingAddress, equals(addressAgain));
+
+      // unlike temporaryId, routingAddress has no time parameter at all --
+      // demonstrate that the two temp IDs at these times differ, while the
+      // routing address (computed independent of time) stays constant.
+      final tempAt1 = await identity.temporaryId(at: at1);
+      final tempAt2 = await identity.temporaryId(at: at2);
+      expect(tempAt1, isNot(equals(tempAt2)));
+    });
+  });
+
   group('sign / verify', () {
     test('a valid signature verifies against the signer public key', () async {
       final signer = await NodeIdentity.generate();

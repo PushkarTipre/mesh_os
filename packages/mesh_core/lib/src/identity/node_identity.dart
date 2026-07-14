@@ -20,6 +20,7 @@ class NodeIdentity {
     required this.signingPublicKey,
     required this.agreementPublicKey,
     required this.nodeId,
+    required this.routingAddress,
   });
 
   static final Ed25519 _signingAlgorithm = Ed25519();
@@ -35,6 +36,12 @@ class NodeIdentity {
   /// Lowercase hex, derived as the first 16 bytes of
   /// SHA-256(signing public key bytes).
   final String nodeId;
+
+  /// A *stable* (non-rotating) 8-byte address used only for multi-hop
+  /// packet routing (Checkpoint 6) -- see [routingAddressForSigningPublicKey]
+  /// for why this exists as a third identifier alongside [nodeId] and
+  /// [temporaryId].
+  final Uint8List routingAddress;
 
   static Future<NodeIdentity> generate() async {
     final signing = await _signingAlgorithm.newKeyPair();
@@ -65,12 +72,14 @@ class NodeIdentity {
     final signingPublicKey = await signing.extractPublicKey();
     final agreementPublicKey = await agreement.extractPublicKey();
     final nodeId = await nodeIdForSigningPublicKey(signingPublicKey);
+    final routingAddress = await routingAddressForSigningPublicKey(signingPublicKey);
     return NodeIdentity._(
       signingKeyPair: signingData,
       agreementKeyPair: agreementData,
       signingPublicKey: signingPublicKey,
       agreementPublicKey: agreementPublicKey,
       nodeId: nodeId,
+      routingAddress: routingAddress,
     );
   }
 
@@ -81,6 +90,32 @@ class NodeIdentity {
   static Future<String> nodeIdForSigningPublicKey(SimplePublicKey signingPublicKey) async {
     final digest = await _hashAlgorithm.hash(signingPublicKey.bytes);
     return _bytesToHex(digest.bytes.sublist(0, 16));
+  }
+
+  /// Derives the routing address for any signing public key -- the first
+  /// 8 bytes of the same SHA-256 digest [nodeId] is drawn from (just
+  /// fewer of them; nodeId uses the first 16).
+  ///
+  /// Why this exists as a *third* identifier, alongside the permanent
+  /// [nodeId] and the rotating [temporaryId]: temp-ID rotation (every 10
+  /// minutes, ARCHITECTURE.md §3) is fine for direct, immediate delivery,
+  /// but is fundamentally incompatible with store-and-forward -- if a
+  /// packet sits with a relay for an hour, the destination's temp ID has
+  /// already rotated six times, so an address computed at send time can
+  /// never match by delivery time. Multi-hop packets (`MeshLink`'s
+  /// routed-packet path) address [tempSourceId]/[tempDestId] with routing
+  /// addresses instead, which trades away temp-ID's anti-tracking
+  /// property for multi-hop traffic specifically: an observer who sees
+  /// the same routing address recur across packets over time can infer
+  /// "these all go to/from the same node," without learning who that is
+  /// (a routing address, like a Node ID, doesn't reveal the public key
+  /// itself). Direct, single-hop packets are unaffected -- they keep
+  /// using the rotating temp ID exactly as before.
+  static Future<Uint8List> routingAddressForSigningPublicKey(
+    SimplePublicKey signingPublicKey,
+  ) async {
+    final digest = await _hashAlgorithm.hash(signingPublicKey.bytes);
+    return Uint8List.fromList(digest.bytes.sublist(0, 8));
   }
 
   static String _bytesToHex(List<int> bytes) =>

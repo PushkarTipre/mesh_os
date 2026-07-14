@@ -45,8 +45,10 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _ready = false;
   String? _error;
   List<MeshDevice> _devices = const [];
+  List<Contact> _contacts = const [];
 
   StreamSubscription<List<MeshDevice>>? _deviceSub;
+  StreamSubscription<List<Contact>>? _contactSub;
 
   @override
   void initState() {
@@ -61,9 +63,17 @@ class _HomeScreenState extends State<HomeScreen> {
         if (!mounted) return;
         setState(() => _devices = devices);
       });
+      _contactSub = _mesh.contactUpdates.listen((contacts) {
+        if (!mounted) return;
+        setState(() => _contacts = contacts);
+      });
       await _mesh.start();
+      final contacts = await _mesh.contacts;
       if (!mounted) return;
-      setState(() => _ready = true);
+      setState(() {
+        _ready = true;
+        _contacts = contacts;
+      });
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = '$e');
@@ -73,6 +83,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _deviceSub?.cancel();
+    _contactSub?.cancel();
     _mesh.dispose();
     super.dispose();
   }
@@ -93,9 +104,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> _setTrustLevel(MeshDevice device, TrustLevel level) async {
-    final nodeId = device.nodeId;
-    if (nodeId == null) return;
+  Future<void> _setTrustLevel(String nodeId, TrustLevel level) async {
     switch (level) {
       case TrustLevel.trusted:
         await _mesh.trust(nodeId);
@@ -127,6 +136,14 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildBody() {
+    // Contacts already reachable directly (shown under "Nearby devices")
+    // are hidden here -- this section is specifically for known contacts
+    // who aren't currently in range, reachable only by routing through
+    // relays (MeshOS.send() picks that automatically -- ChatScreen works
+    // identically either way, see ROADMAP.md Checkpoint 6).
+    final nearbyNodeIds = _devices.map((d) => d.nodeId).whereType<String>().toSet();
+    final farContacts = _contacts.where((c) => !nearbyNodeIds.contains(c.nodeId)).toList();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -139,12 +156,22 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         const Divider(height: 1),
         Expanded(
-          child: _devices.isEmpty
-              ? const Center(child: Text('Searching for nearby MeshOS devices...'))
-              : ListView.builder(
-                  itemCount: _devices.length,
-                  itemBuilder: (context, index) => _buildDeviceTile(_devices[index]),
-                ),
+          child: ListView(
+            children: [
+              _sectionHeader('Nearby devices (${_devices.length})'),
+              if (_devices.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Text('Searching for nearby MeshOS devices...'),
+                )
+              else
+                ..._devices.map(_buildDeviceTile),
+              if (farContacts.isNotEmpty) ...[
+                _sectionHeader('Other known contacts (${farContacts.length})'),
+                ...farContacts.map(_buildContactTile),
+              ],
+            ],
+          ),
         ),
       ],
     );
@@ -168,7 +195,7 @@ class _HomeScreenState extends State<HomeScreen> {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (device.nodeId != null) _buildTrustMenu(device),
+          if (device.nodeId != null) _buildTrustMenu(device.nodeId!, device.trustLevel),
           if (canOpenChat) const Icon(Icons.chevron_right),
         ],
       ),
@@ -186,15 +213,42 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildTrustMenu(MeshDevice device) {
+  /// A known contact who isn't currently a direct neighbor -- tapping
+  /// still opens the same [ChatScreen]; [MeshOS.send] routes through
+  /// relays automatically (Checkpoint 6), so this is exactly how CP6's
+  /// "message someone out of range" demo works through the UI.
+  Widget _buildContactTile(Contact contact) {
+    final label = contact.displayName ?? contact.nodeId;
+    return ListTile(
+      title: Text(label, style: const TextStyle(fontFamily: 'monospace')),
+      subtitle: Text('Not nearby · ${contact.trustLevel.name}'),
+      trailing: _buildTrustMenu(contact.nodeId, contact.trustLevel),
+      onTap: () => Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ChatScreen(
+            mesh: _mesh,
+            historyStore: _historyStore,
+            peerNodeId: contact.nodeId,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _sectionHeader(String title) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+        child: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+      );
+
+  Widget _buildTrustMenu(String nodeId, TrustLevel trustLevel) {
     return PopupMenuButton<TrustLevel>(
-      onSelected: (level) => _setTrustLevel(device, level),
+      onSelected: (level) => _setTrustLevel(nodeId, level),
       itemBuilder: (context) => [
-        if (device.trustLevel != TrustLevel.trusted)
+        if (trustLevel != TrustLevel.trusted)
           const PopupMenuItem(value: TrustLevel.trusted, child: Text('Trust')),
-        if (device.trustLevel != TrustLevel.blocked)
+        if (trustLevel != TrustLevel.blocked)
           const PopupMenuItem(value: TrustLevel.blocked, child: Text('Block')),
-        if (device.trustLevel == TrustLevel.blocked)
+        if (trustLevel == TrustLevel.blocked)
           const PopupMenuItem(value: TrustLevel.known, child: Text('Unblock')),
       ],
     );
@@ -253,7 +307,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _onIncoming(InboundMessage message) {
-    if (widget.mesh.nodeIdForRemoteId(message.remoteId) != widget.peerNodeId) return;
+    // senderNodeId is always populated, whether the message arrived
+    // directly or was routed through relays (Checkpoint 6) -- unlike
+    // remoteId, which is null for a routed message.
+    if (message.senderNodeId != widget.peerNodeId) return;
     setState(() {
       _messages.add(
         ChatMessageRecord(

@@ -25,15 +25,18 @@ import 'storage/drift_trust_store.dart';
 /// ```
 ///
 /// Wraps `mesh_core`'s [MeshLink] (handshake, crypto, reliability, trust
-/// enforcement) and `mesh_transport_nearby`'s [NearbyTransport] rather than
-/// reimplementing anything -- this class is glue, not logic. Every
-/// discovered MeshOS peer is connected to automatically, and every
-/// incoming connection request is auto-accepted; gating *whether to
-/// connect at all* behind trust/relay policy is a later checkpoint
-/// (ARCHITECTURE.md §5, §18), not yet implemented. What CP5 *does* gate:
-/// once connected, a [TrustLevel.blocked] peer is refused a session (or
-/// dropped from one), and only [TrustLevel.trusted] peers ever have a
-/// [MeshDevice.displayName].
+/// enforcement, multi-hop routing) and `mesh_transport_nearby`'s
+/// [NearbyTransport] rather than reimplementing anything -- this class is
+/// glue, not logic. Every discovered MeshOS peer is connected to
+/// automatically, and every incoming connection request is auto-accepted;
+/// gating *whether to connect at all* behind trust/relay policy is a
+/// later checkpoint (ARCHITECTURE.md §5, §18), not yet implemented. What's
+/// gated today: once connected, a [TrustLevel.blocked] peer is refused a
+/// session (or dropped from one); only [TrustLevel.trusted] peers ever
+/// have a [MeshDevice.displayName]; and [send] transparently routes
+/// through relays (flooding + store-and-forward, Checkpoint 6) when the
+/// destination isn't a direct neighbor, so callers never need to know how
+/// many hops a message takes.
 class MeshOS {
   MeshOS({IdentityStore? identityStore, TrustStore? trustStore})
       : _identityStore = identityStore ?? SecureStorageIdentityStore(),
@@ -76,9 +79,11 @@ class MeshOS {
   /// Emits the full device list every time it changes.
   Stream<List<MeshDevice>> get deviceUpdates => _devicesController.stream;
 
-  /// Verified, decrypted incoming messages from any peer. Use
-  /// [nodeIdForRemoteId] to resolve [InboundMessage.remoteId] to a stable
-  /// Node ID for things like persisted chat history.
+  /// Verified, decrypted incoming messages from any peer, direct or
+  /// routed through relays. [InboundMessage.senderNodeId] is always
+  /// populated (use it, not [InboundMessage.remoteId], for things like
+  /// persisted chat history -- `remoteId` is null for a routed message,
+  /// since there's no live connection to the original sender).
   Stream<InboundMessage> get messages => _messagesController.stream;
 
   /// Every contact this device has ever interacted with, regardless of
@@ -221,26 +226,22 @@ class MeshOS {
   }
 
   /// Sends [payload] to the node with permanent id [destination],
-  /// encrypted and signed, retrying until the peer's ack arrives. Throws
-  /// [StateError] if there's no active, handshaked session with that node
-  /// right now (including if they're blocked).
+  /// encrypted and signed. Uses a direct session if [destination] is a
+  /// currently-connected peer (fast, bounded retry); otherwise routes
+  /// through relays -- flooding plus store-and-forward -- as long as
+  /// [destination] is a known contact (met before, directly or via a
+  /// relay), resolving once the destination's end-to-end ack eventually
+  /// arrives. Throws [StateError] if [destination] isn't a known contact
+  /// at all, or if they're blocked.
   Future<DeliveryStatus> send({
     required String destination,
     required List<int> payload,
   }) async {
     final link = _link;
-    final remoteId = _resolveRemoteId(destination);
-    if (link == null || remoteId == null) {
-      throw StateError('MeshOS: no active session with node $destination');
+    if (link == null) {
+      throw StateError('MeshOS: call start() first');
     }
-    return link.sendData(remoteId, payload);
-  }
-
-  String? _resolveRemoteId(String nodeId) {
-    for (final device in _devices.values) {
-      if (device.nodeId == nodeId && device.sessionReady) return device.remoteId;
-    }
-    return null;
+    return link.sendToNode(destination, payload);
   }
 
   /// Resolves a live [InboundMessage.remoteId] (or [MeshDevice.remoteId])

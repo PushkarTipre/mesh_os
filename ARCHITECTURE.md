@@ -79,6 +79,14 @@ Nodes broadcast a rotating temporary ID (e.g. every 10 minutes) instead of the p
 
 **Resolved privacy boundary (as implemented, CP3/CP4):** the permanent public key is never included in what advertising/discovery broadcasts — only the temporary ID (via the transport's advertised name, e.g. Nearby's `userNickName`). A device doing passive scanning without ever connecting learns nothing but a rotating token. The permanent public key is revealed only in the post-*connection* discovery handshake (`MeshLink`, §5) — i.e. to peers you actually establish a link with, not to everyone who can see you nearby. Through CP4, every discovered MeshOS node is auto-connected to (see §5), so in practice this boundary is "connect" vs. "don't," not yet a deliberate trust decision — gating *who gets a handshake at all* behind trust/relay policy is Checkpoint 5.
 
+### Routing address (a third identifier, added Checkpoint 6)
+
+Multi-hop delivery introduced a real problem the temp-ID scheme can't solve: a packet in store-and-forward can sit with a relay for hours, but the destination's temp ID has already rotated (every 10 minutes) many times over by the time it arrives, so an address computed at send time can never match at delivery time.
+
+The fix is a **third identifier**, distinct from both the display-facing Node ID and the rotating temp ID: a stable 8-byte `routingAddress`, derived the same way as the Node ID (a prefix of `SHA-256(signing public key)`, just fewer bytes) but never rotating. Multi-hop `data`/`ack` packets address `tempSourceId`/`tempDestId` with routing addresses instead of temp IDs; direct, single-hop packets are unaffected and keep using the rotating temp ID exactly as before (they're distinguished on the wire by whether `tempDestId` is the `broadcastDestination` sentinel — direct — or a real routing address — routed).
+
+This is a deliberate, narrower privacy trade-off than the temp-ID system, scoped only to multi-hop traffic: an observer who sees the same routing address recur across packets over time can infer "these all go to/from the same node," without learning who that is (a routing address, like a Node ID, doesn't reveal the public key itself). Recording this trade-off explicitly here rather than leaving it implicit in the code is the point — it should be revisited if MeshOS ever needs stronger anonymity guarantees for routed traffic specifically.
+
 ---
 
 ## 4. Trust model
@@ -93,9 +101,9 @@ Every discovered node is in exactly one level:
 | **Blocked** | none | no | no | ignored entirely, no routing |
 
 **Implemented as of Checkpoint 5** (`TrustStore`/`Contact`/`TrustLevel` in `mesh_core`, enforced in `MeshLink`), with one clarified departure from the table above: through CP5, **Known and Unknown behave identically** -- both can message (matching CP4's exit criterion, where two never-met phones already chat with no prior trust step), and "Unknown" in practice just means "no stored `Contact` yet," which stops being true the instant a discovery handshake completes (auto-promoted to Known -- "interacted before"). What actually differs by level today:
-- **Blocked** — refused a session at handshake time, or torn down immediately if already connected, at both send and receive (`MeshLink._handleDiscovery`/`_onDataEvent`/`sendData`).
+- **Blocked** — refused a session at handshake time, or torn down immediately if already connected, at both send and receive (`MeshLink._handleDiscovery`/`_onDataEvent`/`sendData`). As of Checkpoint 6, this also covers *routed* traffic: if a multi-hop packet's resolved original sender is blocked, the recipient drops it silently instead of delivering it, even though it successfully routed through one or more relays to get there.
 - **Trusted** — the only level with a `displayName` (see §5's privacy boundary below).
-- Relay-level gating ("policy-dependent" for Unknown, above) doesn't apply yet — there's no relaying until multi-hop routing exists (Checkpoint 6).
+- **"Can relay via us"** (Checkpoint 6's `RelayPolicy`) is keyed off the *direct* peer handing a node its bytes, not the packet's ultimate origin — `RelayPolicy.trustedContactsOnly` means "only relay for direct peers I've explicitly trusted," which is a stricter, simpler v1 reading of the "policy-dependent" cell above (not yet the full per-level matrix from the original table).
 
 Becoming contacts = both users intentionally exchange identities (QR code, nearby exchange, NFC, share code). Once accepted: public keys stored, nicknames visible, secure comms begin. Implemented via `IdentityCard` (`mesh_core`) -- a self-certifying, signed bundle of public keys + a chosen display name, exchanged as a QR code in `mesh_console` (`qr_flutter` to show, `mobile_scanner` to scan). `MeshOS.trustFromIdentityCard()` verifies and upgrades that peer to Trusted in one step.
 
@@ -144,13 +152,19 @@ Deliberately staged — do not build AODV first:
 
 Routing metrics (later versions): signal quality, hop count, battery, reliability, historical success rate.
 
+**v1 flooding implemented as of Checkpoint 6** (`MeshLink`): a `data`/`ack` packet not addressed to this node (its `tempDestId` doesn't match this node's `routingAddress`, §3) is decremented via `MeshPacket.forwarded()` and flooded to every other connected peer, deduplicated by packet ID so it's forwarded at most once per relay. Relay policy (`RelayPolicy`: `everything` / `trustedContactsOnly` / `disabled`) gates whether a node relays *at all* on behalf of a given direct peer — battery/charging/Wi-Fi-gated policy from the original design is deferred. A simple per-source sliding-window cap (basic DoS hygiene) stops one noisy or hostile neighbor from turning a node into an unbounded flood amplifier for their traffic.
+
 ### Store and forward
 If the destination is unreachable, packets persist locally and hop opportunistically (`Alice → stored → Charlie appears → forwarded → Charlie stores → Bob appears → delivered`). Every packet has TTL + expiration so the mesh doesn't fill with dead traffic.
+
+**Implemented as of Checkpoint 6**, in-memory only: `MeshLink` keeps an unrouted packet (one it originated via `sendToNode`, or one it's relaying for someone else) in a local cache until it either gets forwarded successfully or its `storeAndForwardExpiry` (default 24h) elapses. Every new connection is a fresh delivery opportunity — the store is re-flooded to a peer the moment their discovery handshake completes. **Known limitation:** this doesn't survive an app restart (it's not SQLite-backed, unlike contacts/trust — see §9); a relay that's killed and relaunched loses whatever it was holding. Persisting the relay store the same way contacts are persisted is a natural, not-yet-built follow-up.
 
 ### Reliability
 ACKs, retries, duplicate detection (packet-ID cache), sequence numbers, expiration, delivery confirmation.
 
-**Implemented as of Checkpoint 4** for single-hop delivery (`MeshLink.sendData`): a `data` packet is retried on a timer until the peer's `ack` packet arrives or retries are exhausted (`DeliveryStatus.delivered`/`failed`); a retry can cause the same packet to arrive twice (e.g. only the ack was lost), so incoming packets are deduplicated by packet ID (`PacketDedupCache`) before being surfaced to the app — the receiver still re-sends the ack either way. End-to-end reliability across multiple hops (store-and-forward, §7 above) is Checkpoint 6.
+**Single-hop implemented as of Checkpoint 4** (`MeshLink.sendData`): a `data` packet is retried on a timer until the peer's `ack` packet arrives or retries are exhausted (`DeliveryStatus.delivered`/`failed`); a retry can cause the same packet to arrive twice (e.g. only the ack was lost), so incoming packets are deduplicated by packet ID (`PacketDedupCache`) before being surfaced to the app — the receiver still re-sends the ack either way.
+
+**End-to-end (multi-hop) implemented as of Checkpoint 6** (`MeshLink.sendToNode`): once the actual destination decrypts a routed packet, it sends its own `ack` back through the mesh (flooded/stored exactly like data traffic, addressed via routing address), which the original sender eventually receives and matches to resolve its pending `sendToNode` call. Unlike the bounded, timed retry of a direct send, a routed send has no fixed retry schedule — it just waits, resolving `delivered` whenever the ack eventually shows up (which could be much later) or `failed` once the packet expires from the local store-and-forward cache without one. `MeshOS.send()` picks whichever path applies automatically: direct if the destination is a live neighbor, routed otherwise — callers never need to know how many hops a message took.
 
 ---
 
@@ -180,7 +194,7 @@ final mesh = MeshOS();
 await mesh.initialize();       // load/create identity
 await mesh.start();            // start discovery + transports
 
-await mesh.send(destination: nodeId, payload: bytes);  // returns DeliveryStatus
+await mesh.send(destination: nodeId, payload: bytes);  // direct or multi-hop, transparently -- returns DeliveryStatus
 await mesh.broadcast(bytes);                            // target: Checkpoint 7
 
 mesh.devices;                  // reactive list of nearby nodes
@@ -194,7 +208,7 @@ await mesh.createIdentityCard(displayName: 'Pushkar');   // QR/NFC/share-code pa
 await mesh.trustFromIdentityCard(scannedPayload);        // verifies + trusts in one step
 ```
 
-`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). `broadcast` isn't implemented yet — it needs multi-hop routing (§7), which doesn't exist until Checkpoint 6/7.
+`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). As of Checkpoint 6, `send` transparently routes through relays (`MeshLink.sendToNode`, §7) when the destination isn't a direct neighbor -- callers never chose "direct" vs "routed" and don't need to. `broadcast` still isn't implemented -- it's a different distribution model (fan-out to everyone within TTL, not addressed unicast delivery) and lands in Checkpoint 7.
 
 ---
 
