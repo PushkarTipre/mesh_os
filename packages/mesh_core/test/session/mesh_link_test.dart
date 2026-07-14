@@ -196,4 +196,191 @@ void main() {
       await transportB.dispose();
     });
   });
+
+  group('PeerSession.nodeId', () {
+    test('is the peer\'s permanent Node ID, derived from their signing key', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA)..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final sessionOfBOnA = linkA.sessions.firstWhere((s) => s.remoteId == 'B');
+      expect(sessionOfBOnA.nodeId, equals(identityB.nodeId));
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+  });
+
+  group('delivery: ACK, retry, and duplicate suppression', () {
+    test('a normal send resolves delivered once the ack arrives', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA)..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final status = await linkA
+          .sendData('B', utf8.encode('hi'), retryInterval: const Duration(seconds: 5))
+          .timeout(const Duration(seconds: 2));
+
+      expect(status, equals(DeliveryStatus.delivered));
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+
+    test('a send that gets lost in transit retries and eventually delivers', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA)..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      // The first two attempts vanish; the third gets through.
+      transportA.dropNextSends(2);
+
+      final received = linkB.messages.first;
+      final status = await linkA.sendData(
+        'B',
+        utf8.encode('are you there?'),
+        retryInterval: const Duration(milliseconds: 30),
+      );
+
+      expect(status, equals(DeliveryStatus.delivered));
+      final message = await received.timeout(const Duration(seconds: 2));
+      expect(utf8.decode(message.plaintext), equals('are you there?'));
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+
+    test('a send that never gets acked fails after exhausting retries', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA)..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      // every attempt (initial + all retries) vanishes
+      transportA.dropNextSends(100);
+
+      final status = await linkA
+          .sendData(
+            'B',
+            utf8.encode('lost cause'),
+            maxRetries: 2,
+            retryInterval: const Duration(milliseconds: 20),
+          )
+          .timeout(const Duration(seconds: 2));
+
+      expect(status, equals(DeliveryStatus.failed));
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+
+    test('disconnecting fails a pending send immediately, without waiting '
+        'out the full retry schedule', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA)..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      transportA.dropNextSends(100);
+
+      final sendFuture = linkA.sendData(
+        'B',
+        utf8.encode('will this ever arrive?'),
+        maxRetries: 10,
+        retryInterval: const Duration(seconds: 30),
+      );
+      await Future<void>.delayed(Duration.zero); // let the first attempt go out
+      await transportA.disconnect('B');
+
+      final status = await sendFuture.timeout(const Duration(seconds: 1));
+      expect(status, equals(DeliveryStatus.failed));
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+
+    test('a lost ack causes a resend but the app only sees the message once', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA)..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final received = <String>[];
+      linkB.messages.listen((m) => received.add(utf8.decode(m.plaintext)));
+
+      // B's ack for the first (successful) delivery gets lost, forcing A
+      // to resend the identical data packet.
+      transportB.dropNextSends(1);
+
+      final status = await linkA.sendData(
+        'B',
+        utf8.encode('only once, please'),
+        retryInterval: const Duration(milliseconds: 30),
+      );
+
+      expect(status, equals(DeliveryStatus.delivered));
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(received, equals(['only once, please']));
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+  });
 }

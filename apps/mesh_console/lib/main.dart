@@ -3,7 +3,8 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:mesh_os/mesh_os.dart';
-import 'package:mesh_transport_nearby/mesh_transport_nearby.dart';
+
+import 'chat_history.dart';
 
 void main() {
   runApp(const MeshConsoleApp());
@@ -16,47 +17,35 @@ class MeshConsoleApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'MeshOS Console',
-      home: const ConsoleScreen(),
+      home: const HomeScreen(),
     );
   }
 }
 
-/// CP3 exit-criterion demo: two Android phones running this screen should
-/// discover each other over Nearby Connections, connect, complete the
-/// MeshLink discovery handshake automatically, and exchange signed,
-/// encrypted test packets -- with the log showing verify+decrypt success
-/// on both sides. See ROADMAP.md Checkpoint 3.
+/// CP4 exit-criterion demo: two Android phones, airplane mode, chatting
+/// both directions; kill and reopen the app -- identity and message
+/// history survive. See ROADMAP.md Checkpoint 4.
 ///
-/// This is a raw instrument panel, not a product screen: every nearby
-/// MeshOS node is auto-accepted on connection request (trust/contacts is
-/// a later checkpoint -- ARCHITECTURE.md §7, §9), and the temporary ID is
-/// computed once at launch rather than rotated.
-class ConsoleScreen extends StatefulWidget {
-  const ConsoleScreen({super.key});
+/// Deliberately thin: all discovery/connection/handshake logic now lives
+/// behind the [MeshOS] facade (compare to CP3's hand-wired
+/// NearbyTransport + MeshLink) -- this screen just reacts to
+/// [MeshOS.deviceUpdates] and taps into [MeshOS.messages]/[MeshOS.send].
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
 
   @override
-  State<ConsoleScreen> createState() => _ConsoleScreenState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _ConsoleScreenState extends State<ConsoleScreen> {
-  final _identityStore = SecureStorageIdentityStore();
+class _HomeScreenState extends State<HomeScreen> {
+  final MeshOS _mesh = MeshOS();
+  final ChatHistoryStore _historyStore = ChatHistoryStore();
 
-  NodeIdentity? _identity;
-  String? _temporaryId;
-  NearbyTransport? _transport;
-  MeshLink? _link;
-  bool _permissionsGranted = false;
-  String? _bootstrapError;
+  bool _ready = false;
+  String? _error;
+  List<MeshDevice> _devices = const [];
 
-  final Map<String, DeviceEvent> _discovered = {};
-  final Set<String> _connected = {};
-  final Set<String> _sessioned = {};
-  final List<String> _log = [];
-
-  StreamSubscription<DeviceEvent>? _deviceSub;
-  StreamSubscription<ConnectionEvent>? _connectionSub;
-  StreamSubscription<InboundMessage>? _messageSub;
-  StreamSubscription<String>? _sessionSub;
+  StreamSubscription<List<MeshDevice>>? _deviceSub;
 
   @override
   void initState() {
@@ -64,237 +53,268 @@ class _ConsoleScreenState extends State<ConsoleScreen> {
     _bootstrap();
   }
 
+  Future<void> _bootstrap() async {
+    try {
+      await _mesh.initialize();
+      _deviceSub = _mesh.deviceUpdates.listen((devices) {
+        if (!mounted) return;
+        setState(() => _devices = devices);
+      });
+      await _mesh.start();
+      if (!mounted) return;
+      setState(() => _ready = true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = '$e');
+    }
+  }
+
   @override
   void dispose() {
     _deviceSub?.cancel();
-    _connectionSub?.cancel();
-    _messageSub?.cancel();
-    _sessionSub?.cancel();
-    _link?.dispose();
-    _transport?.dispose();
+    _mesh.dispose();
     super.dispose();
-  }
-
-  String _timestamp() {
-    final now = DateTime.now();
-    String two(int n) => n.toString().padLeft(2, '0');
-    return '${two(now.hour)}:${two(now.minute)}:${two(now.second)}';
-  }
-
-  void _appendLog(String line) {
-    if (!mounted) return;
-    setState(() => _log.insert(0, '[${_timestamp()}] $line'));
-  }
-
-  Future<void> _bootstrap() async {
-    try {
-      final identity = await NodeIdentity.loadOrCreate(_identityStore);
-      // Computed once per launch -- real temp-ID rotation handling is a
-      // later checkpoint (ARCHITECTURE.md §6).
-      final tempId = await identity.temporaryId();
-
-      final granted = await NearbyPermissions.requestAll();
-
-      final transport = NearbyTransport();
-      final link = MeshLink(transport: transport, identity: identity)..start();
-
-      _deviceSub = transport.deviceEvents.listen(_onDeviceEvent);
-      _connectionSub = transport.connectionEvents.listen(_onConnectionEvent);
-      _messageSub = link.messages.listen(_onMessage);
-      _sessionSub = link.sessionEstablished.listen(_onSessionEstablished);
-
-      setState(() {
-        _identity = identity;
-        _temporaryId = tempId;
-        _permissionsGranted = granted;
-        _transport = transport;
-        _link = link;
-      });
-
-      _appendLog('Identity ready. Node ID: ${identity.nodeId}');
-      _appendLog('Temporary ID: $tempId');
-
-      if (!granted) {
-        _appendLog(
-          'WARNING: not all Nearby permissions were granted -- advertising/discovery will likely fail.',
-        );
-        return;
-      }
-
-      await transport.startAdvertising(localId: tempId);
-      await transport.startDiscovery(localId: tempId);
-      _appendLog('Advertising and discovering as $tempId');
-    } catch (e) {
-      setState(() => _bootstrapError = '$e');
-      _appendLog('Bootstrap failed: $e');
-    }
-  }
-
-  void _onDeviceEvent(DeviceEvent event) {
-    setState(() {
-      if (event.type == DeviceEventType.found) {
-        _discovered[event.remoteId] = event;
-      } else {
-        _discovered.remove(event.remoteId);
-      }
-    });
-    final action = event.type == DeviceEventType.found ? 'found' : 'lost';
-    _appendLog('Device $action: ${event.remoteId} (${event.advertisedName ?? '?'})');
-  }
-
-  Future<void> _onConnectionEvent(ConnectionEvent event) async {
-    _appendLog('Connection event: ${event.type} (${event.remoteId})');
-    switch (event.type) {
-      case ConnectionEventType.incomingRequest:
-        await _transport?.respondToConnectionRequest(event.remoteId, accept: true);
-        _appendLog('Auto-accepted connection request from ${event.remoteId}');
-      case ConnectionEventType.connected:
-        setState(() => _connected.add(event.remoteId));
-      case ConnectionEventType.disconnected:
-      case ConnectionEventType.failed:
-        setState(() {
-          _connected.remove(event.remoteId);
-          _sessioned.remove(event.remoteId);
-        });
-    }
-  }
-
-  void _onSessionEstablished(String remoteId) {
-    setState(() => _sessioned.add(remoteId));
-    _appendLog(
-      'Discovery handshake complete with $remoteId -- signature verified, session ready',
-    );
-  }
-
-  void _onMessage(InboundMessage message) {
-    _appendLog(
-      'Received from ${message.remoteId}: "${utf8.decode(message.plaintext)}" '
-      '(signature verified, decrypted OK)',
-    );
-  }
-
-  Future<void> _connectTo(String remoteId) async {
-    _appendLog('Connecting to $remoteId ...');
-    await _transport?.connect(remoteId);
-  }
-
-  Future<void> _disconnectFrom(String remoteId) async {
-    await _transport?.disconnect(remoteId);
-  }
-
-  Future<void> _sendTestPacket(String remoteId) async {
-    final message = 'Hello from ${_temporaryId ?? '?'} at ${_timestamp()}';
-    try {
-      await _link?.sendData(remoteId, utf8.encode(message));
-      _appendLog('Sent to $remoteId: "$message" (signed + encrypted)');
-    } catch (e) {
-      _appendLog('Send to $remoteId failed: $e');
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('MeshOS Console')),
-      body: _identity == null && _bootstrapError == null
+      body: !_ready && _error == null
           ? const Center(child: CircularProgressIndicator())
-          : _bootstrapError != null
-              ? Center(child: Text('Bootstrap failed: $_bootstrapError'))
-              : _buildConsole(),
+          : _error != null
+              ? Center(child: Text('Failed to start: $_error'))
+              : _buildBody(),
     );
   }
 
-  Widget _buildConsole() {
+  Widget _buildBody() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _buildIdentityCard(),
-        const Divider(height: 1),
-        Expanded(
-          flex: 2,
-          child: ListView(
-            children: [
-              _sectionHeader('Nearby devices (${_discovered.length})'),
-              ..._discovered.values.map(_buildDeviceTile),
-              _sectionHeader('Connected peers (${_connected.length})'),
-              ..._connected.map(_buildConnectedTile),
-            ],
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Text(
+            'Node ID: ${_mesh.identity.nodeId}',
+            style: const TextStyle(fontFamily: 'monospace'),
           ),
         ),
         const Divider(height: 1),
-        _sectionHeader('Log'),
         Expanded(
-          flex: 3,
-          child: ListView.builder(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            itemCount: _log.length,
-            itemBuilder: (context, index) => Text(
-              _log[index],
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-            ),
-          ),
+          child: _devices.isEmpty
+              ? const Center(child: Text('Searching for nearby MeshOS devices...'))
+              : ListView.builder(
+                  itemCount: _devices.length,
+                  itemBuilder: (context, index) => _buildDeviceTile(_devices[index]),
+                ),
         ),
       ],
     );
   }
 
-  Widget _buildIdentityCard() {
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('Node ID: ${_identity!.nodeId}', style: const TextStyle(fontFamily: 'monospace')),
-          Text(
-            'Temporary ID: ${_temporaryId ?? '...'}',
-            style: const TextStyle(fontFamily: 'monospace'),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            _permissionsGranted ? 'Nearby permissions granted' : 'Nearby permissions NOT granted',
-            style: TextStyle(color: _permissionsGranted ? Colors.green : Colors.red),
-          ),
-        ],
-      ),
+  Widget _buildDeviceTile(MeshDevice device) {
+    final label = device.nodeId ?? device.remoteId;
+    final subtitle = !device.connected
+        ? 'Connecting...'
+        : !device.sessionReady
+            ? 'Handshaking...'
+            : 'Ready to chat';
+    final canOpenChat = device.sessionReady && device.nodeId != null;
+
+    return ListTile(
+      title: Text(label, style: const TextStyle(fontFamily: 'monospace')),
+      subtitle: Text(subtitle),
+      trailing: canOpenChat ? const Icon(Icons.chevron_right) : null,
+      onTap: canOpenChat
+          ? () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => ChatScreen(
+                    mesh: _mesh,
+                    historyStore: _historyStore,
+                    peerNodeId: device.nodeId!,
+                  ),
+                ),
+              )
+          : null,
     );
   }
+}
 
-  Widget _sectionHeader(String title) => Padding(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-        child: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({
+    super.key,
+    required this.mesh,
+    required this.historyStore,
+    required this.peerNodeId,
+  });
+
+  final MeshOS mesh;
+  final ChatHistoryStore historyStore;
+  final String peerNodeId;
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final TextEditingController _textController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  final List<ChatMessageRecord> _messages = [];
+
+  Map<String, List<ChatMessageRecord>> _allHistory = {};
+  StreamSubscription<InboundMessage>? _messageSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHistory();
+    _messageSub = widget.mesh.messages.listen(_onIncoming);
+  }
+
+  @override
+  void dispose() {
+    _messageSub?.cancel();
+    _textController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadHistory() async {
+    final history = await widget.historyStore.loadAll();
+    if (!mounted) return;
+    setState(() {
+      _allHistory = history;
+      _messages
+        ..clear()
+        ..addAll(history[widget.peerNodeId] ?? const []);
+    });
+    _scrollToBottom();
+  }
+
+  void _onIncoming(InboundMessage message) {
+    if (widget.mesh.nodeIdForRemoteId(message.remoteId) != widget.peerNodeId) return;
+    setState(() {
+      _messages.add(
+        ChatMessageRecord(
+          outgoing: false,
+          text: utf8.decode(message.plaintext),
+          timestamp: DateTime.now(),
+          status: 'received',
+        ),
       );
+    });
+    unawaited(_persist());
+    _scrollToBottom();
+  }
 
-  Widget _buildDeviceTile(DeviceEvent event) {
-    final alreadyConnected = _connected.contains(event.remoteId);
-    return ListTile(
-      dense: true,
-      title: Text(event.advertisedName ?? event.remoteId),
-      subtitle: Text(event.remoteId, style: const TextStyle(fontFamily: 'monospace')),
-      trailing: ElevatedButton(
-        onPressed: alreadyConnected ? null : () => _connectTo(event.remoteId),
-        child: Text(alreadyConnected ? 'Connected' : 'Connect'),
+  Future<void> _persist() async {
+    _allHistory[widget.peerNodeId] = List.of(_messages);
+    await widget.historyStore.saveAll(_allHistory);
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+    });
+  }
+
+  Future<void> _send() async {
+    final text = _textController.text.trim();
+    if (text.isEmpty) return;
+    _textController.clear();
+
+    final record = ChatMessageRecord(
+      outgoing: true,
+      text: text,
+      timestamp: DateTime.now(),
+      status: 'sending',
+    );
+    final index = _messages.length;
+    setState(() => _messages.add(record));
+    unawaited(_persist());
+    _scrollToBottom();
+
+    try {
+      final status = await widget.mesh.send(
+        destination: widget.peerNodeId,
+        payload: utf8.encode(text),
+      );
+      if (!mounted) return;
+      setState(() {
+        _messages[index] = record.copyWith(
+          status: status == DeliveryStatus.delivered ? 'delivered' : 'failed',
+        );
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _messages[index] = record.copyWith(status: 'failed'));
+    }
+    unawaited(_persist());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          widget.peerNodeId,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
+        ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              controller: _scrollController,
+              padding: const EdgeInsets.all(12),
+              itemCount: _messages.length,
+              itemBuilder: (context, index) => _buildBubble(_messages[index]),
+            ),
+          ),
+          const Divider(height: 1),
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    decoration: const InputDecoration(hintText: 'Message'),
+                    onSubmitted: (_) => _send(),
+                  ),
+                ),
+                IconButton(icon: const Icon(Icons.send), onPressed: _send),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
 
-  Widget _buildConnectedTile(String remoteId) {
-    final ready = _sessioned.contains(remoteId);
-    return ListTile(
-      dense: true,
-      title: Text(remoteId, style: const TextStyle(fontFamily: 'monospace')),
-      subtitle: Text(ready ? 'Session ready' : 'Handshaking...'),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ElevatedButton(
-            onPressed: ready ? () => _sendTestPacket(remoteId) : null,
-            child: const Text('Send test packet'),
-          ),
-          IconButton(
-            icon: const Icon(Icons.link_off),
-            onPressed: () => _disconnectFrom(remoteId),
-          ),
-        ],
+  Widget _buildBubble(ChatMessageRecord message) {
+    return Align(
+      alignment: message.outgoing ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: message.outgoing ? Colors.blue.shade100 : Colors.grey.shade200,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(message.text),
+            if (message.outgoing)
+              Text(
+                message.status,
+                style: const TextStyle(fontSize: 10, color: Colors.black54),
+              ),
+          ],
+        ),
       ),
     );
   }

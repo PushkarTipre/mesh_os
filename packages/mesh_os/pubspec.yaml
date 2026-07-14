@@ -15,6 +15,8 @@ dependencies:
     sdk: flutter
   mesh_core:
     path: ../mesh_core
+  mesh_transport_nearby:
+    path: ../mesh_transport_nearby
   flutter_secure_storage: ^9.2.2
 
 dev_dependencies:

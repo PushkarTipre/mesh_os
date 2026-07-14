@@ -8,11 +8,21 @@ import 'package:cryptography/cryptography.dart';
 class PeerSession {
   const PeerSession({
     required this.remoteId,
+    required this.nodeId,
     required this.signingPublicKey,
     required this.agreementPublicKey,
   });
 
+  /// Transport-level connection-addressable id -- ephemeral, changes
+  /// across reconnects (e.g. Nearby's `endpointId`).
   final String remoteId;
+
+  /// This peer's permanent Node ID, derived from [signingPublicKey] --
+  /// stable across reconnects. Use this, not [remoteId], for anything
+  /// that should survive the peer disconnecting and reconnecting (e.g.
+  /// message history).
+  final String nodeId;
+
   final SimplePublicKey signingPublicKey;
   final SimplePublicKey agreementPublicKey;
 }

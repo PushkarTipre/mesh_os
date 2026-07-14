@@ -51,6 +51,14 @@ class FakeTransport implements Transport {
   String? _localId;
   final Map<String, FakeTransport> _pendingIncoming = {};
   final Map<String, FakeTransport> _connected = {};
+  int _dropNextSends = 0;
+
+  /// Test hook: the next [count] calls to [send] are silently swallowed,
+  /// as if the packet never arrived -- simulates radio packet loss for
+  /// exercising retry/reliability logic.
+  void dropNextSends(int count) {
+    _dropNextSends += count;
+  }
 
   final _deviceEvents = StreamController<DeviceEvent>.broadcast();
   final _connectionEvents = StreamController<ConnectionEvent>.broadcast();
@@ -135,6 +143,10 @@ class FakeTransport implements Transport {
     final peer = _connected[remoteId];
     if (peer == null) {
       throw StateError('FakeTransport($_localId): not connected to $remoteId');
+    }
+    if (_dropNextSends > 0) {
+      _dropNextSends -= 1;
+      return;
     }
     peer._dataEvents.add(DataEvent(remoteId: _localId!, data: data));
   }

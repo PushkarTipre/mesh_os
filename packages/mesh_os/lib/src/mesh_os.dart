@@ -1,0 +1,214 @@
+import 'dart:async';
+
+import 'package:mesh_core/mesh_core.dart';
+import 'package:mesh_transport_nearby/mesh_transport_nearby.dart';
+
+import 'mesh_device.dart';
+import 'secure_storage_identity_store.dart';
+
+/// The MeshOS public API (ARCHITECTURE.md §19): the facade a host app
+/// builds on, so it never has to touch Bluetooth/Nearby, packet framing,
+/// or crypto directly.
+///
+/// ```dart
+/// final mesh = MeshOS();
+/// await mesh.initialize();
+/// await mesh.start();
+///
+/// await mesh.send(destination: nodeId, payload: bytes);
+/// mesh.messages.listen((msg) => ...);
+/// ```
+///
+/// Wraps `mesh_core`'s [MeshLink] (handshake, crypto, reliability) and
+/// `mesh_transport_nearby`'s [NearbyTransport] rather than reimplementing
+/// anything -- this class is glue, not logic. Every discovered MeshOS
+/// peer is connected to automatically, and every incoming connection
+/// request is auto-accepted; gating that behind trust/relay policy is a
+/// later checkpoint (ARCHITECTURE.md §7, §18), not yet implemented.
+class MeshOS {
+  MeshOS({IdentityStore? identityStore})
+      : _identityStore = identityStore ?? SecureStorageIdentityStore();
+
+  final IdentityStore _identityStore;
+
+  NodeIdentity? _identity;
+  Transport? _transport;
+  MeshLink? _link;
+  bool _started = false;
+
+  final Map<String, MeshDevice> _devices = {};
+  final Set<String> _connectAttempted = {};
+
+  final StreamController<List<MeshDevice>> _devicesController =
+      StreamController<List<MeshDevice>>.broadcast();
+  final StreamController<InboundMessage> _messagesController =
+      StreamController<InboundMessage>.broadcast();
+
+  StreamSubscription<DeviceEvent>? _deviceSub;
+  StreamSubscription<ConnectionEvent>? _connectionSub;
+  StreamSubscription<String>? _sessionSub;
+  StreamSubscription<InboundMessage>? _messageSub;
+
+  /// This node's permanent, stable identity. Only valid after [initialize].
+  NodeIdentity get identity {
+    final id = _identity;
+    if (id == null) {
+      throw StateError('MeshOS: call initialize() before using this getter');
+    }
+    return id;
+  }
+
+  /// Currently known nearby/connected devices.
+  List<MeshDevice> get devices => List.unmodifiable(_devices.values);
+
+  /// Emits the full device list every time it changes.
+  Stream<List<MeshDevice>> get deviceUpdates => _devicesController.stream;
+
+  /// Verified, decrypted incoming messages from any peer. Use
+  /// [nodeIdForRemoteId] to resolve [InboundMessage.remoteId] to a stable
+  /// Node ID for things like persisted chat history.
+  Stream<InboundMessage> get messages => _messagesController.stream;
+
+  /// Loads (or generates, on first launch) this device's identity. Call
+  /// once before [start].
+  Future<void> initialize() async {
+    _identity = await NodeIdentity.loadOrCreate(_identityStore);
+  }
+
+  /// Starts advertising and discovering over the available transports,
+  /// and begins auto-connecting to every MeshOS peer found.
+  Future<void> start() async {
+    if (_started) return;
+    _started = true;
+
+    await NearbyPermissions.requestAll();
+
+    final transport = NearbyTransport();
+    final link = MeshLink(transport: transport, identity: identity)..start();
+    _transport = transport;
+    _link = link;
+
+    _deviceSub = transport.deviceEvents.listen(_onDeviceEvent);
+    _connectionSub = transport.connectionEvents.listen(_onConnectionEvent);
+    _sessionSub = link.sessionEstablished.listen(_onSessionEstablished);
+    _messageSub = link.messages.listen(_messagesController.add);
+
+    final tempId = await identity.temporaryId();
+    await transport.startAdvertising(localId: tempId);
+    await transport.startDiscovery(localId: tempId);
+  }
+
+  void _onDeviceEvent(DeviceEvent event) {
+    if (event.type == DeviceEventType.lost) {
+      // A connected peer can also drop out of *discovery* results
+      // (Nearby stops reporting endpoints it's already connected to)
+      // without actually disconnecting -- only forget it here if it was
+      // never connected in the first place.
+      final existing = _devices[event.remoteId];
+      if (existing == null || !existing.connected) {
+        _devices.remove(event.remoteId);
+        _connectAttempted.remove(event.remoteId);
+        _publishDevices();
+      }
+      return;
+    }
+
+    if (!_devices.containsKey(event.remoteId)) {
+      _devices[event.remoteId] = MeshDevice(
+        remoteId: event.remoteId,
+        connected: false,
+        sessionReady: false,
+      );
+      _publishDevices();
+    }
+
+    // Attempt a connection exactly once per "not yet connected" streak --
+    // Nearby can re-announce an already-attempted endpoint while
+    // discovery keeps running.
+    if (_connectAttempted.add(event.remoteId)) {
+      unawaited(_transport?.connect(event.remoteId));
+    }
+  }
+
+  Future<void> _onConnectionEvent(ConnectionEvent event) async {
+    switch (event.type) {
+      case ConnectionEventType.incomingRequest:
+        await _transport?.respondToConnectionRequest(event.remoteId, accept: true);
+      case ConnectionEventType.connected:
+        final existing = _devices[event.remoteId] ??
+            MeshDevice(remoteId: event.remoteId, connected: false, sessionReady: false);
+        _devices[event.remoteId] = existing.copyWith(connected: true);
+        _publishDevices();
+      case ConnectionEventType.disconnected:
+      case ConnectionEventType.failed:
+        _connectAttempted.remove(event.remoteId);
+        final existing = _devices[event.remoteId];
+        if (existing != null) {
+          _devices[event.remoteId] = existing.copyWith(connected: false, sessionReady: false);
+          _publishDevices();
+        }
+    }
+  }
+
+  void _onSessionEstablished(String remoteId) {
+    final link = _link;
+    if (link == null) return;
+    PeerSession? session;
+    for (final candidate in link.sessions) {
+      if (candidate.remoteId == remoteId) {
+        session = candidate;
+        break;
+      }
+    }
+    if (session == null) return;
+
+    final existing = _devices[remoteId] ??
+        MeshDevice(remoteId: remoteId, connected: true, sessionReady: false);
+    _devices[remoteId] = existing.copyWith(nodeId: session.nodeId, sessionReady: true);
+    _publishDevices();
+  }
+
+  void _publishDevices() {
+    _devicesController.add(devices);
+  }
+
+  /// Sends [payload] to the node with permanent id [destination],
+  /// encrypted and signed, retrying until the peer's ack arrives. Throws
+  /// [StateError] if there's no active, handshaked session with that node
+  /// right now.
+  Future<DeliveryStatus> send({
+    required String destination,
+    required List<int> payload,
+  }) async {
+    final link = _link;
+    final remoteId = _resolveRemoteId(destination);
+    if (link == null || remoteId == null) {
+      throw StateError('MeshOS: no active session with node $destination');
+    }
+    return link.sendData(remoteId, payload);
+  }
+
+  String? _resolveRemoteId(String nodeId) {
+    for (final device in _devices.values) {
+      if (device.nodeId == nodeId && device.sessionReady) return device.remoteId;
+    }
+    return null;
+  }
+
+  /// Resolves a live [InboundMessage.remoteId] (or [MeshDevice.remoteId])
+  /// to the peer's stable, permanent Node ID -- use this, not remoteId,
+  /// as a persistence key (e.g. chat history), since remoteId changes
+  /// across reconnects.
+  String? nodeIdForRemoteId(String remoteId) => _devices[remoteId]?.nodeId;
+
+  Future<void> dispose() async {
+    await _deviceSub?.cancel();
+    await _connectionSub?.cancel();
+    await _sessionSub?.cancel();
+    await _messageSub?.cancel();
+    await _link?.dispose();
+    await _transport?.dispose();
+    await _devicesController.close();
+    await _messagesController.close();
+  }
+}

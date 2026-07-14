@@ -15,8 +15,7 @@ dependencies:
     path: ../../packages/mesh_core
   mesh_os:
     path: ../../packages/mesh_os
-  mesh_transport_nearby:
-    path: ../../packages/mesh_transport_nearby
+  flutter_secure_storage: ^9.2.2
 
 dev_dependencies:
   flutter_test:

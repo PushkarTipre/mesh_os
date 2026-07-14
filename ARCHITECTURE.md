@@ -77,6 +77,8 @@ Display name, nickname, avatar — shared **only** with trusted contacts. Unknow
 ### Temporary identity (anti-tracking)
 Nodes broadcast a rotating temporary ID (e.g. every 10 minutes) instead of the permanent Node ID. Only trusted peers can associate temporary IDs with permanent identities (via a keyed derivation only contacts can compute). Reduces passive tracking.
 
+**Resolved privacy boundary (as implemented, CP3/CP4):** the permanent public key is never included in what advertising/discovery broadcasts — only the temporary ID (via the transport's advertised name, e.g. Nearby's `userNickName`). A device doing passive scanning without ever connecting learns nothing but a rotating token. The permanent public key is revealed only in the post-*connection* discovery handshake (`MeshLink`, §5) — i.e. to peers you actually establish a link with, not to everyone who can see you nearby. Through CP4, every discovered MeshOS node is auto-connected to (see §5), so in practice this boundary is "connect" vs. "don't," not yet a deliberate trust decision — gating *who gets a handshake at all* behind trust/relay policy is Checkpoint 5.
+
 ---
 
 ## 4. Trust model
@@ -99,7 +101,12 @@ Relay everything / trusted-contacts only / emergency only / disabled — optiona
 
 ## 5. Discovery
 
-Continuous scan + advertise. Nodes exchange **only**: temporary ID, public key, MeshOS version, supported transports. Nothing personal.
+Continuous scan + advertise. Two distinct phases, with different information exposure:
+
+1. **Passive discovery** (advertise/scan, no connection yet): nodes exchange only the temporary ID (carried in the transport's advertised name) and whatever the transport itself exposes (e.g. Nearby's service ID, used to filter to MeshOS nodes only). No public key, no personal information.
+2. **Post-connection handshake** (`MeshLink`, implemented CP3): once two nodes connect, both immediately send a signed packet containing their permanent signing + agreement public keys. This is *self-certifying* — a signature only verifies against the public key it claims to belong to, so a valid signature over that packet is proof of private-key possession, with no separate key-exchange step needed. This is what lets `MeshOS.send()` encrypt to a specific recipient (§10) without a pre-existing trust relationship.
+
+Through Checkpoint 4, connection itself is unconditional: every discovered MeshOS node is auto-connected to and auto-accepted, so every direct peer eventually learns your permanent public key. Checkpoint 5 adds the missing piece — trust/relay policy deciding *whether to connect at all*, not just what happens after.
 
 ---
 
@@ -138,6 +145,8 @@ If the destination is unreachable, packets persist locally and hop opportunistic
 ### Reliability
 ACKs, retries, duplicate detection (packet-ID cache), sequence numbers, expiration, delivery confirmation.
 
+**Implemented as of Checkpoint 4** for single-hop delivery (`MeshLink.sendData`): a `data` packet is retried on a timer until the peer's `ack` packet arrives or retries are exhausted (`DeliveryStatus.delivered`/`failed`); a retry can cause the same packet to arrive twice (e.g. only the ack was lost), so incoming packets are deduplicated by packet ID (`PacketDedupCache`) before being surfaced to the app — the receiver still re-sends the ack either way. End-to-end reliability across multiple hops (store-and-forward, §7 above) is Checkpoint 6.
+
 ---
 
 ## 8. Security model
@@ -157,22 +166,25 @@ SQLite (`drift` or `sqflite`) for: known nodes, trusted contacts, pending packet
 
 ---
 
-## 10. Public Flutter API (target)
+## 10. Public Flutter API
 
 ```dart
 final mesh = MeshOS();
 await mesh.initialize();       // load/create identity
 await mesh.start();            // start discovery + transports
 
-await mesh.send(destination: nodeId, payload: bytes);
-await mesh.broadcast(bytes);
+await mesh.send(destination: nodeId, payload: bytes);  // returns DeliveryStatus
+await mesh.broadcast(bytes);                            // target: Checkpoint 7
 
 mesh.devices;                  // reactive list of nearby nodes
+mesh.deviceUpdates.listen((devices) => ...);
 mesh.messages.listen((msg) => ...);
 
-await mesh.trust(nodeId);
-await mesh.block(nodeId);
+await mesh.trust(nodeId);      // target: Checkpoint 5
+await mesh.block(nodeId);      // target: Checkpoint 5
 ```
+
+`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `broadcast`/`trust`/`block` aren't implemented yet — they need multi-hop routing (§7) and the trust model (§4) respectively, neither of which exists yet.
 
 ---
 

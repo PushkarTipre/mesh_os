@@ -67,16 +67,16 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 ---
 
-## Checkpoint 4 — Direct encrypted messaging (= PDF Phase 1 complete)
+## Checkpoint 4 — Direct encrypted messaging (= PDF Phase 1 complete) ✅ code done, on-device demo still needed
 
 **Goal:** the public API works end-to-end for one hop.
 
-- [ ] `MeshOS` facade: `initialize()`, `start()`, `send()`, `messages`, `devices`. Wraps CP3's `MeshLink` + `NearbyTransport` rather than reimplementing them.
-- [ ] Replace CP3's minimal self-certifying handshake with the real discovery protocol (temp ID, pubkey, version, transports) — decide here whether/how permanent public keys stay off the open beacon (ARCHITECTURE.md §7-9 territory that CP3 deliberately deferred).
-- [ ] ACK + retry + delivery status for direct messages.
-- [ ] Minimal chat UI in `mesh_console` (this is a test harness, not a product).
+- [x] `MeshOS` facade: `initialize()`, `start()`, `send()`, `messages`, `devices`, `deviceUpdates`. (`packages/mesh_os/lib/src/mesh_os.dart`) Wraps CP3's `MeshLink` + `NearbyTransport` rather than reimplementing them; auto-connects to every discovered peer and auto-accepts incoming requests (trust-gating that is CP5).
+- [x] Formalized (rather than replaced) CP3's handshake as the real v1 discovery mechanism, and documented the resulting privacy boundary explicitly in ARCHITECTURE.md §3/§5: passive scanning only ever reveals the rotating temp ID; the permanent public key is revealed only in the post-connection handshake, to peers you actually connect to.
+- [x] ACK + retry + delivery status for direct messages (`MeshLink.sendData` now returns `Future<DeliveryStatus>`), plus duplicate-delivery suppression via `PacketDedupCache` for the case where a retry's *ack* was what got lost, not the original data. All of this — retry-then-deliver, retry-exhaustion failure, immediate failure on disconnect, and the lost-ack/no-duplicate-surfaced case — is unit tested against `FakeTransport` with zero hardware.
+- [x] Minimal chat UI in `mesh_console`: device list → tap a handshaked peer → per-peer chat screen, with message history persisted (keyed by the peer's permanent Node ID, not the ephemeral transport remoteId — see `PeerSession.nodeId`'s doc comment for why that distinction matters) and per-message delivery status (sending/delivered/failed).
 
-**Exit criterion (demo):** two phones, airplane mode, chat both directions; kill and reopen the app — identity and message history survive.
+**Exit criterion (demo):** two phones, airplane mode, chat both directions; kill and reopen the app — identity and message history survive. **Not yet run on real hardware** — same situation as CP3: everything up to the transport boundary is proven in `packages/mesh_core`'s test suite (66 tests), but the actual two-phone demo needs real devices. See README.md.
 
 ---
 

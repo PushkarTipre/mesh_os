@@ -64,8 +64,7 @@ class NodeIdentity {
     final agreementData = await agreement.extract();
     final signingPublicKey = await signing.extractPublicKey();
     final agreementPublicKey = await agreement.extractPublicKey();
-    final digest = await _hashAlgorithm.hash(signingPublicKey.bytes);
-    final nodeId = _bytesToHex(digest.bytes.sublist(0, 16));
+    final nodeId = await nodeIdForSigningPublicKey(signingPublicKey);
     return NodeIdentity._(
       signingKeyPair: signingData,
       agreementKeyPair: agreementData,
@@ -73,6 +72,15 @@ class NodeIdentity {
       agreementPublicKey: agreementPublicKey,
       nodeId: nodeId,
     );
+  }
+
+  /// Derives the Node ID for any signing public key, not just this
+  /// identity's own -- lets a caller who has learned a peer's public key
+  /// (e.g. via [MeshLink]'s discovery handshake) compute that peer's
+  /// permanent Node ID without needing their private key.
+  static Future<String> nodeIdForSigningPublicKey(SimplePublicKey signingPublicKey) async {
+    final digest = await _hashAlgorithm.hash(signingPublicKey.bytes);
+    return _bytesToHex(digest.bytes.sublist(0, 16));
   }
 
   static String _bytesToHex(List<int> bytes) =>
