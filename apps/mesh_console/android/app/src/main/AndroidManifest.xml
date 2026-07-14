@@ -29,6 +29,10 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- QR-code identity exchange (CP5, mobile_scanner) -- ARCHITECTURE.md §9 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
     <application
         android:label="mesh_os"
         android:name="${applicationName}"

@@ -80,17 +80,19 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 ---
 
-## Checkpoint 5 — Trust, contacts & persistence (= PDF Phase 2)
+## Checkpoint 5 — Trust, contacts & persistence (= PDF Phase 2) ✅ code done, on-device demo still needed
 
 **Goal:** the trust model is real.
 
-- [ ] SQLite schema: known nodes, contacts, keys, preferences (drift migrations from day one).
-- [ ] Trust levels (trusted/known/unknown/blocked) enforced in the packet pipeline: profile data only to trusted; blocked = dropped at ingress.
-- [ ] QR-code identity exchange (show + scan), mutual-accept flow.
-- [ ] Display name/nickname/avatar shared to trusted contacts only.
-- [ ] `trust(nodeId)` / `block(nodeId)` API.
+- [x] SQLite schema via `drift`: contacts (node id, public keys, trust level, display name, first-seen) in `packages/mesh_os/lib/src/storage/`. Pending packets/routing cache/preferences aren't needed yet -- they join this database in later checkpoints rather than starting a new one.
+- [x] Trust levels (trusted/known/unknown/blocked) enforced in `MeshLink`: a first-ever handshake auto-creates a `known` contact; a `blocked` contact is refused a session (or dropped from one, at both send and receive) at every checkpoint in the packet pipeline. See ARCHITECTURE.md §4 for the one clarified departure from the original table (known/unknown both message freely -- that's what CP4's exit criterion already required).
+- [x] QR-code identity exchange (show + scan): `IdentityCard` (`mesh_core`) is a self-certifying signed bundle of public keys + display name; `mesh_console` renders/scans it via `qr_flutter`/`mobile_scanner`. `MeshOS.trustFromIdentityCard()` verifies and trusts in one step.
+- [x] Display name shared to trusted contacts only -- never included in the ordinary discovery handshake (only in the explicit `IdentityCard` exchange), so it's structurally impossible for an untrusted peer to learn it.
+- [x] `trust(nodeId)` / `block(nodeId)` / `unblock(nodeId)` API on `MeshOS`, with `block()` proactively disconnecting the peer if currently connected rather than waiting for their next packet.
 
-**Exit criterion (demo):** two strangers see each other as "Unknown" (no names). QR exchange → names appear. Block → all traffic from that node ignored.
+**Design note:** the ordinary discovery handshake was deliberately *not* changed to reference the trust store for anything beyond blocking -- known and unknown nodes still complete the same self-certifying handshake from CP3/CP4 and can message immediately. This matches the roadmap as originally scoped here, not the PDF's literal (and, on inspection, self-contradictory-with-CP4) trust table; see ARCHITECTURE.md §4 for the reasoning.
+
+**Exit criterion (demo):** two strangers see each other with no name (just their Node ID). QR exchange → names appear on both sides. Block → the blocked device is disconnected within moments and can't reconnect. **Not yet run on real hardware** — same situation as CP3/CP4: the trust/crypto logic is proven in `packages/mesh_core`'s test suite (82 tests) and the SQLite layer against real (in-memory) SQLite in `packages/mesh_os` (7 tests), but actually scanning a QR code between two phones needs real cameras. See README.md.
 
 ---
 

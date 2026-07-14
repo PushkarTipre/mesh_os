@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:mesh_os/mesh_os.dart';
 
 import 'chat_history.dart';
+import 'identity_card_screens.dart';
 
 void main() {
   runApp(const MeshConsoleApp());
@@ -76,10 +77,47 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
+  Future<void> _showMyCode() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => MyIdentityCardScreen(mesh: _mesh)),
+    );
+  }
+
+  Future<void> _scanCode() async {
+    final contact = await Navigator.of(context).push(
+      MaterialPageRoute<Contact?>(builder: (_) => ScanIdentityCardScreen(mesh: _mesh)),
+    );
+    if (contact == null || !mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Trusted ${contact.displayName ?? contact.nodeId}')),
+    );
+  }
+
+  Future<void> _setTrustLevel(MeshDevice device, TrustLevel level) async {
+    final nodeId = device.nodeId;
+    if (nodeId == null) return;
+    switch (level) {
+      case TrustLevel.trusted:
+        await _mesh.trust(nodeId);
+      case TrustLevel.blocked:
+        await _mesh.block(nodeId);
+      case TrustLevel.known:
+        await _mesh.unblock(nodeId);
+      case TrustLevel.unknown:
+        break;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('MeshOS Console')),
+      appBar: AppBar(
+        title: const Text('MeshOS Console'),
+        actions: [
+          IconButton(icon: const Icon(Icons.qr_code), onPressed: _showMyCode),
+          IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: _scanCode),
+        ],
+      ),
       body: !_ready && _error == null
           ? const Center(child: CircularProgressIndicator())
           : _error != null
@@ -113,18 +151,27 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildDeviceTile(MeshDevice device) {
-    final label = device.nodeId ?? device.remoteId;
-    final subtitle = !device.connected
+    // A display name only ever shows up for a trusted contact -- see
+    // ARCHITECTURE.md §5's privacy boundary.
+    final label = device.displayName ?? device.nodeId ?? device.remoteId;
+    final status = !device.connected
         ? 'Connecting...'
         : !device.sessionReady
             ? 'Handshaking...'
             : 'Ready to chat';
+    final subtitle = '$status · ${device.trustLevel.name}';
     final canOpenChat = device.sessionReady && device.nodeId != null;
 
     return ListTile(
       title: Text(label, style: const TextStyle(fontFamily: 'monospace')),
       subtitle: Text(subtitle),
-      trailing: canOpenChat ? const Icon(Icons.chevron_right) : null,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (device.nodeId != null) _buildTrustMenu(device),
+          if (canOpenChat) const Icon(Icons.chevron_right),
+        ],
+      ),
       onTap: canOpenChat
           ? () => Navigator.of(context).push(
                 MaterialPageRoute<void>(
@@ -136,6 +183,20 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               )
           : null,
+    );
+  }
+
+  Widget _buildTrustMenu(MeshDevice device) {
+    return PopupMenuButton<TrustLevel>(
+      onSelected: (level) => _setTrustLevel(device, level),
+      itemBuilder: (context) => [
+        if (device.trustLevel != TrustLevel.trusted)
+          const PopupMenuItem(value: TrustLevel.trusted, child: Text('Trust')),
+        if (device.trustLevel != TrustLevel.blocked)
+          const PopupMenuItem(value: TrustLevel.blocked, child: Text('Block')),
+        if (device.trustLevel == TrustLevel.blocked)
+          const PopupMenuItem(value: TrustLevel.known, child: Text('Unblock')),
+      ],
     );
   }
 }

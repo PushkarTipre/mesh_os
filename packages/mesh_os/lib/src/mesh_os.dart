@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:mesh_core/mesh_core.dart';
 import 'package:mesh_transport_nearby/mesh_transport_nearby.dart';
 
 import 'mesh_device.dart';
 import 'secure_storage_identity_store.dart';
+import 'storage/drift_trust_store.dart';
 
 /// The MeshOS public API (ARCHITECTURE.md §19): the facade a host app
 /// builds on, so it never has to touch Bluetooth/Nearby, packet framing,
@@ -17,19 +19,28 @@ import 'secure_storage_identity_store.dart';
 ///
 /// await mesh.send(destination: nodeId, payload: bytes);
 /// mesh.messages.listen((msg) => ...);
+///
+/// await mesh.trust(nodeId);
+/// await mesh.block(nodeId);
 /// ```
 ///
-/// Wraps `mesh_core`'s [MeshLink] (handshake, crypto, reliability) and
-/// `mesh_transport_nearby`'s [NearbyTransport] rather than reimplementing
-/// anything -- this class is glue, not logic. Every discovered MeshOS
-/// peer is connected to automatically, and every incoming connection
-/// request is auto-accepted; gating that behind trust/relay policy is a
-/// later checkpoint (ARCHITECTURE.md §7, §18), not yet implemented.
+/// Wraps `mesh_core`'s [MeshLink] (handshake, crypto, reliability, trust
+/// enforcement) and `mesh_transport_nearby`'s [NearbyTransport] rather than
+/// reimplementing anything -- this class is glue, not logic. Every
+/// discovered MeshOS peer is connected to automatically, and every
+/// incoming connection request is auto-accepted; gating *whether to
+/// connect at all* behind trust/relay policy is a later checkpoint
+/// (ARCHITECTURE.md §5, §18), not yet implemented. What CP5 *does* gate:
+/// once connected, a [TrustLevel.blocked] peer is refused a session (or
+/// dropped from one), and only [TrustLevel.trusted] peers ever have a
+/// [MeshDevice.displayName].
 class MeshOS {
-  MeshOS({IdentityStore? identityStore})
-      : _identityStore = identityStore ?? SecureStorageIdentityStore();
+  MeshOS({IdentityStore? identityStore, TrustStore? trustStore})
+      : _identityStore = identityStore ?? SecureStorageIdentityStore(),
+        _trustStore = trustStore ?? DriftTrustStore();
 
   final IdentityStore _identityStore;
+  final TrustStore _trustStore;
 
   NodeIdentity? _identity;
   Transport? _transport;
@@ -48,6 +59,7 @@ class MeshOS {
   StreamSubscription<ConnectionEvent>? _connectionSub;
   StreamSubscription<String>? _sessionSub;
   StreamSubscription<InboundMessage>? _messageSub;
+  StreamSubscription<List<Contact>>? _contactSub;
 
   /// This node's permanent, stable identity. Only valid after [initialize].
   NodeIdentity get identity {
@@ -69,6 +81,13 @@ class MeshOS {
   /// Node ID for things like persisted chat history.
   Stream<InboundMessage> get messages => _messagesController.stream;
 
+  /// Every contact this device has ever interacted with, regardless of
+  /// whether they're currently nearby (ARCHITECTURE.md §4, §9).
+  Future<List<Contact>> get contacts => _trustStore.listContacts();
+
+  /// Emits the full contact list every time trust/profile data changes.
+  Stream<List<Contact>> get contactUpdates => _trustStore.watchContacts();
+
   /// Loads (or generates, on first launch) this device's identity. Call
   /// once before [start].
   Future<void> initialize() async {
@@ -84,7 +103,8 @@ class MeshOS {
     await NearbyPermissions.requestAll();
 
     final transport = NearbyTransport();
-    final link = MeshLink(transport: transport, identity: identity)..start();
+    final link = MeshLink(transport: transport, identity: identity, trustStore: _trustStore)
+      ..start();
     _transport = transport;
     _link = link;
 
@@ -92,6 +112,7 @@ class MeshOS {
     _connectionSub = transport.connectionEvents.listen(_onConnectionEvent);
     _sessionSub = link.sessionEstablished.listen(_onSessionEstablished);
     _messageSub = link.messages.listen(_messagesController.add);
+    _contactSub = _trustStore.watchContacts().listen(_onContactsChanged);
 
     final tempId = await identity.temporaryId();
     await transport.startAdvertising(localId: tempId);
@@ -150,7 +171,7 @@ class MeshOS {
     }
   }
 
-  void _onSessionEstablished(String remoteId) {
+  Future<void> _onSessionEstablished(String remoteId) async {
     final link = _link;
     if (link == null) return;
     PeerSession? session;
@@ -162,10 +183,37 @@ class MeshOS {
     }
     if (session == null) return;
 
+    final contact = await _trustStore.getContact(session.nodeId);
     final existing = _devices[remoteId] ??
         MeshDevice(remoteId: remoteId, connected: true, sessionReady: false);
-    _devices[remoteId] = existing.copyWith(nodeId: session.nodeId, sessionReady: true);
+    _devices[remoteId] = existing.copyWith(
+      nodeId: session.nodeId,
+      sessionReady: true,
+      trustLevel: contact?.trustLevel ?? TrustLevel.known,
+      displayName: contact?.displayName,
+    );
     _publishDevices();
+  }
+
+  /// Keeps nearby devices' [MeshDevice.trustLevel]/[MeshDevice.displayName]
+  /// in sync with trust changes (e.g. a QR exchange or a block) that
+  /// happen while they're already connected, without needing a reconnect.
+  void _onContactsChanged(List<Contact> contacts) {
+    var changed = false;
+    for (final contact in contacts) {
+      for (final device in _devices.values.toList()) {
+        if (device.nodeId != contact.nodeId) continue;
+        if (device.trustLevel == contact.trustLevel && device.displayName == contact.displayName) {
+          continue;
+        }
+        _devices[device.remoteId] = device.copyWith(
+          trustLevel: contact.trustLevel,
+          displayName: contact.displayName,
+        );
+        changed = true;
+      }
+    }
+    if (changed) _publishDevices();
   }
 
   void _publishDevices() {
@@ -175,7 +223,7 @@ class MeshOS {
   /// Sends [payload] to the node with permanent id [destination],
   /// encrypted and signed, retrying until the peer's ack arrives. Throws
   /// [StateError] if there's no active, handshaked session with that node
-  /// right now.
+  /// right now (including if they're blocked).
   Future<DeliveryStatus> send({
     required String destination,
     required List<int> payload,
@@ -201,11 +249,79 @@ class MeshOS {
   /// across reconnects.
   String? nodeIdForRemoteId(String remoteId) => _devices[remoteId]?.nodeId;
 
+  /// Promotes an already-known node to [TrustLevel.trusted], without
+  /// setting a display name. Most apps will use [trustFromIdentityCard]
+  /// instead, which also exchanges a name; this is the bare API from
+  /// ARCHITECTURE.md §19. Throws [StateError] if this device has never
+  /// connected to [nodeId] before (so there's no public key on file).
+  Future<void> trust(String nodeId) async {
+    final existing = await _trustStore.getContact(nodeId);
+    if (existing == null) {
+      throw StateError('MeshOS: no known contact with node $nodeId yet');
+    }
+    await _trustStore.upsertContact(existing.copyWith(trustLevel: TrustLevel.trusted));
+  }
+
+  /// Blocks [nodeId]: refuses any future session with them and, if
+  /// they're currently connected, disconnects immediately. Throws
+  /// [StateError] if this device has never connected to [nodeId] before.
+  Future<void> block(String nodeId) async {
+    final existing = await _trustStore.getContact(nodeId);
+    if (existing == null) {
+      throw StateError('MeshOS: no known contact with node $nodeId yet');
+    }
+    await _trustStore.upsertContact(existing.copyWith(trustLevel: TrustLevel.blocked));
+
+    for (final device in _devices.values) {
+      if (device.nodeId == nodeId) {
+        await _transport?.disconnect(device.remoteId);
+      }
+    }
+  }
+
+  /// Reverts a blocked contact back to [TrustLevel.known]. No-op if
+  /// [nodeId] isn't a known contact at all.
+  Future<void> unblock(String nodeId) async {
+    final existing = await _trustStore.getContact(nodeId);
+    if (existing == null) return;
+    await _trustStore.upsertContact(existing.copyWith(trustLevel: TrustLevel.known));
+  }
+
+  /// Builds this device's shareable identity card for the "Becoming
+  /// Contacts" flow (ARCHITECTURE.md §9) -- encode it into a QR code, an
+  /// NFC payload, or a share code. [displayName] is what the other person
+  /// will see; it's never revealed anywhere else.
+  Future<String> createIdentityCard({required String displayName}) =>
+      IdentityCard.encode(identity: identity, displayName: displayName);
+
+  /// Processes a scanned/received identity card: verifies it, then
+  /// upgrades that peer to [TrustLevel.trusted] with the exchanged
+  /// display name. Returns the resulting [Contact], or null if the card
+  /// was invalid or tampered with.
+  Future<Contact?> trustFromIdentityCard(String encoded) async {
+    final card = await IdentityCard.decode(encoded);
+    if (card == null) return null;
+
+    final nodeId = await card.resolveNodeId();
+    final existing = await _trustStore.getContact(nodeId);
+    final contact = Contact(
+      nodeId: nodeId,
+      signingPublicKeyBytes: Uint8List.fromList(card.signingPublicKey.bytes),
+      agreementPublicKeyBytes: Uint8List.fromList(card.agreementPublicKey.bytes),
+      trustLevel: TrustLevel.trusted,
+      displayName: card.displayName,
+      firstSeenAt: existing?.firstSeenAt ?? DateTime.now().toUtc(),
+    );
+    await _trustStore.upsertContact(contact);
+    return contact;
+  }
+
   Future<void> dispose() async {
     await _deviceSub?.cancel();
     await _connectionSub?.cancel();
     await _sessionSub?.cancel();
     await _messageSub?.cancel();
+    await _contactSub?.cancel();
     await _link?.dispose();
     await _transport?.dispose();
     await _devicesController.close();

@@ -16,6 +16,8 @@ dependencies:
   mesh_os:
     path: ../../packages/mesh_os
   flutter_secure_storage: ^9.2.2
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^7.0.1
 
 dev_dependencies:
   flutter_test:

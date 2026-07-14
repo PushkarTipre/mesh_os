@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -376,6 +377,144 @@ void main() {
       expect(status, equals(DeliveryStatus.delivered));
       await Future<void>.delayed(const Duration(milliseconds: 100));
       expect(received, equals(['only once, please']));
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+  });
+
+  group('trust enforcement', () {
+    test('a first-ever handshake auto-creates a known contact', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+      final trustStoreA = InMemoryTrustStore();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA, trustStore: trustStoreA)
+        ..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final contact = await trustStoreA.getContact(identityB.nodeId);
+      expect(contact, isNotNull);
+      expect(contact!.trustLevel, equals(TrustLevel.known));
+      expect(contact.displayName, isNull); // never set by the raw handshake
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+
+    test('a blocked contact never gets a session, and gets disconnected', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+      final trustStoreA = InMemoryTrustStore();
+
+      // A already has B on file as blocked, from a previous encounter.
+      await trustStoreA.upsertContact(Contact(
+        nodeId: identityB.nodeId,
+        signingPublicKeyBytes: Uint8List.fromList(identityB.signingPublicKey.bytes),
+        agreementPublicKeyBytes: Uint8List.fromList(identityB.agreementPublicKey.bytes),
+        trustLevel: TrustLevel.blocked,
+        firstSeenAt: DateTime.utc(2026, 1, 1),
+      ));
+
+      final linkA = MeshLink(transport: transportA, identity: identityA, trustStore: trustStoreA)
+        ..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      final aDisconnected = transportA.connectionEvents.firstWhere(
+        (e) => e.type == ConnectionEventType.disconnected,
+      );
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await aDisconnected.timeout(const Duration(seconds: 2));
+
+      expect(linkA.hasSession('B'), isFalse);
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+
+    test('blocking mid-session drops the next packet and tears down the session', () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+      final trustStoreA = InMemoryTrustStore();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA, trustStore: trustStoreA)
+        ..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(linkA.hasSession('B'), isTrue);
+
+      // Now block B, after the session is already live.
+      final contact = (await trustStoreA.getContact(identityB.nodeId))!;
+      await trustStoreA.upsertContact(contact.copyWith(trustLevel: TrustLevel.blocked));
+
+      // sendData should refuse immediately rather than actually deliver.
+      await expectLater(
+        () => linkA.sendData('B', utf8.encode('should not send')),
+        throwsA(isA<StateError>()),
+      );
+      expect(linkA.hasSession('B'), isFalse);
+
+      await linkA.dispose();
+      await linkB.dispose();
+      await transportA.dispose();
+      await transportB.dispose();
+    });
+
+    test('an incoming packet from a peer blocked mid-session is dropped and disconnects them',
+        () async {
+      final network = FakeTransportNetwork();
+      final transportA = FakeTransport(network);
+      final transportB = FakeTransport(network);
+      final identityA = await NodeIdentity.generate();
+      final identityB = await NodeIdentity.generate();
+      final trustStoreA = InMemoryTrustStore();
+
+      final linkA = MeshLink(transport: transportA, identity: identityA, trustStore: trustStoreA)
+        ..start();
+      final linkB = MeshLink(transport: transportB, identity: identityB)..start();
+
+      await _connect(transportA, transportB, aId: 'A', bId: 'B');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final contact = (await trustStoreA.getContact(identityB.nodeId))!;
+      await trustStoreA.upsertContact(contact.copyWith(trustLevel: TrustLevel.blocked));
+
+      final aDisconnected = transportA.connectionEvents.firstWhere(
+        (e) => e.type == ConnectionEventType.disconnected,
+      );
+
+      // B doesn't know it's been blocked and sends normally -- A's link
+      // must drop it and hang up rather than deliver it. Deliberately not
+      // awaited: B will retry for several seconds before giving up, which
+      // this test doesn't care about -- linkB.dispose() below cleans up
+      // the pending send/timer regardless.
+      final received = <String>[];
+      linkA.messages.listen((m) => received.add(utf8.decode(m.plaintext)));
+      unawaited(linkB.sendData('A', utf8.encode('hi')));
+
+      await aDisconnected.timeout(const Duration(seconds: 2));
+      expect(received, isEmpty);
 
       await linkA.dispose();
       await linkB.dispose();

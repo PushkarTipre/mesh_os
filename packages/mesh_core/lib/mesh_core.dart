@@ -17,3 +17,8 @@ export 'src/session/mesh_link.dart';
 export 'src/session/peer_session.dart';
 
 export 'src/transport/transport.dart';
+
+export 'src/trust/contact.dart';
+export 'src/trust/identity_card.dart';
+export 'src/trust/trust_level.dart';
+export 'src/trust/trust_store.dart';

@@ -92,10 +92,15 @@ Every discovered node is in exactly one level:
 | **Unknown** | none | no (relay only) | policy-dependent | auto-discovered |
 | **Blocked** | none | no | no | ignored entirely, no routing |
 
-Becoming contacts = both users intentionally exchange identities (QR code, nearby exchange, NFC, share code). Once accepted: public keys stored, nicknames visible, secure comms begin.
+**Implemented as of Checkpoint 5** (`TrustStore`/`Contact`/`TrustLevel` in `mesh_core`, enforced in `MeshLink`), with one clarified departure from the table above: through CP5, **Known and Unknown behave identically** -- both can message (matching CP4's exit criterion, where two never-met phones already chat with no prior trust step), and "Unknown" in practice just means "no stored `Contact` yet," which stops being true the instant a discovery handshake completes (auto-promoted to Known -- "interacted before"). What actually differs by level today:
+- **Blocked** — refused a session at handshake time, or torn down immediately if already connected, at both send and receive (`MeshLink._handleDiscovery`/`_onDataEvent`/`sendData`).
+- **Trusted** — the only level with a `displayName` (see §5's privacy boundary below).
+- Relay-level gating ("policy-dependent" for Unknown, above) doesn't apply yet — there's no relaying until multi-hop routing exists (Checkpoint 6).
+
+Becoming contacts = both users intentionally exchange identities (QR code, nearby exchange, NFC, share code). Once accepted: public keys stored, nicknames visible, secure comms begin. Implemented via `IdentityCard` (`mesh_core`) -- a self-certifying, signed bundle of public keys + a chosen display name, exchanged as a QR code in `mesh_console` (`qr_flutter` to show, `mobile_scanner` to scan). `MeshOS.trustFromIdentityCard()` verifies and upgrades that peer to Trusted in one step.
 
 ### Relay permissions (user-controlled)
-Relay everything / trusted-contacts only / emergency only / disabled — optionally gated by charging state, Wi-Fi, or battery threshold.
+Relay everything / trusted-contacts only / emergency only / disabled — optionally gated by charging state, Wi-Fi, or battery threshold. Not implemented yet -- lands with routing in Checkpoint 6.
 
 ---
 
@@ -164,6 +169,8 @@ ACKs, retries, duplicate detection (packet-ID cache), sequence numbers, expirati
 
 SQLite (`drift` or `sqflite`) for: known nodes, trusted contacts, pending packets, delivered-packet dedup cache, routing cache, public keys, preferences. Private keys go in secure storage, **not** SQLite.
 
+**Implemented as of Checkpoint 5**, contacts only so far: `drift` (`packages/mesh_os/lib/src/storage/`), one `ContactRows` table backing `DriftTrustStore`. Pending packets, routing cache, and preferences don't exist yet -- they land in later checkpoints (store-and-forward is Checkpoint 6) and will join the same database rather than starting a new one. Tested against a real (in-memory) SQLite engine via `NativeDatabase.memory()`, not mocked.
+
 ---
 
 ## 10. Public Flutter API
@@ -180,11 +187,14 @@ mesh.devices;                  // reactive list of nearby nodes
 mesh.deviceUpdates.listen((devices) => ...);
 mesh.messages.listen((msg) => ...);
 
-await mesh.trust(nodeId);      // target: Checkpoint 5
-await mesh.block(nodeId);      // target: Checkpoint 5
+await mesh.trust(nodeId);
+await mesh.block(nodeId);
+await mesh.unblock(nodeId);
+await mesh.createIdentityCard(displayName: 'Pushkar');   // QR/NFC/share-code payload
+await mesh.trustFromIdentityCard(scannedPayload);        // verifies + trusts in one step
 ```
 
-`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `broadcast`/`trust`/`block` aren't implemented yet — they need multi-hop routing (§7) and the trust model (§4) respectively, neither of which exists yet.
+`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). `broadcast` isn't implemented yet — it needs multi-hop routing (§7), which doesn't exist until Checkpoint 6/7.
 
 ---
 

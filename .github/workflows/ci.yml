@@ -24,3 +24,7 @@ jobs:
       - name: Test mesh_core
         run: dart test
         working-directory: packages/mesh_core
+
+      - name: Test mesh_os
+        run: flutter test
+        working-directory: packages/mesh_os

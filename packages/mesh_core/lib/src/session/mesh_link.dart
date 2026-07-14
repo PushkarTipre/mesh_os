@@ -13,6 +13,9 @@ import '../packet/packet_dedup_cache.dart';
 import '../packet/packet_type.dart';
 import '../packet/reassembler.dart';
 import '../transport/transport.dart';
+import '../trust/contact.dart';
+import '../trust/trust_level.dart';
+import '../trust/trust_store.dart';
 import 'peer_session.dart';
 
 const int _publicKeyLength = 32; // Ed25519 and X25519 keys are both 32 bytes
@@ -84,10 +87,20 @@ class _PendingSend {
 /// before being surfaced on [messages] -- the receiver still re-sends the
 /// ack either way, since that's what the sender is actually waiting on.
 class MeshLink {
-  MeshLink({required this.transport, required this.identity});
+  MeshLink({
+    required this.transport,
+    required this.identity,
+    TrustStore? trustStore,
+  }) : trustStore = trustStore ?? InMemoryTrustStore();
 
   final Transport transport;
   final NodeIdentity identity;
+
+  /// Contact records (trust level, display name) survive across
+  /// reconnects and app restarts -- unlike [PeerSession], which is
+  /// ephemeral. Defaults to an in-memory store if the caller doesn't
+  /// supply a persistent one (mesh_os's `DriftTrustStore`).
+  final TrustStore trustStore;
 
   final Map<String, PeerSession> _sessions = {};
   final Map<String, Reassembler> _reassemblers = {};
@@ -211,6 +224,15 @@ class MeshLink {
       return; // doesn't match this session's peer -- drop
     }
 
+    // Defense in depth: a contact can be blocked *while* a session is
+    // already live (the handshake-time check in _handleDiscovery only
+    // covers new/reconnecting sessions).
+    if (await trustStore.trustLevelFor(session.nodeId) == TrustLevel.blocked) {
+      _sessions.remove(event.remoteId);
+      await transport.disconnect(event.remoteId);
+      return;
+    }
+
     switch (packet.type) {
       case PacketType.data:
         await _handleData(event.remoteId, packet, session);
@@ -236,9 +258,33 @@ class MeshLink {
     // claims to belong to.
     if (!await packet.verifySignature(signingPublicKey)) return;
 
+    final nodeId = await NodeIdentity.nodeIdForSigningPublicKey(signingPublicKey);
+    final existingContact = await trustStore.getContact(nodeId);
+
+    // "Blocked = dropped at ingress" (ARCHITECTURE.md SS4): never
+    // establish a session with a blocked node, and hang up the transport
+    // connection outright.
+    if (existingContact?.trustLevel == TrustLevel.blocked) {
+      await transport.disconnect(remoteId);
+      return;
+    }
+
+    if (existingContact == null) {
+      // First-ever contact -- "interacted before" makes it at least
+      // known. Trusted only ever comes from an explicit IdentityCard
+      // exchange (mesh_os's MeshOS.trust*), never automatically.
+      await trustStore.upsertContact(Contact(
+        nodeId: nodeId,
+        signingPublicKeyBytes: Uint8List.fromList(signingPublicKey.bytes),
+        agreementPublicKeyBytes: Uint8List.fromList(agreementPublicKey.bytes),
+        trustLevel: TrustLevel.known,
+        firstSeenAt: DateTime.now().toUtc(),
+      ));
+    }
+
     _sessions[remoteId] = PeerSession(
       remoteId: remoteId,
-      nodeId: await NodeIdentity.nodeIdForSigningPublicKey(signingPublicKey),
+      nodeId: nodeId,
       signingPublicKey: signingPublicKey,
       agreementPublicKey: agreementPublicKey,
     );
@@ -298,7 +344,8 @@ class MeshLink {
   /// Encrypts and sends [plaintext] to [remoteId], retrying up to
   /// [maxRetries] times (every [retryInterval]) until the peer's ack
   /// arrives. Requires a session to already be established (i.e. the
-  /// discovery handshake has completed) -- throws [StateError] otherwise.
+  /// discovery handshake has completed) -- throws [StateError] otherwise,
+  /// including if the peer has since been blocked.
   Future<DeliveryStatus> sendData(
     String remoteId,
     List<int> plaintext, {
@@ -308,6 +355,10 @@ class MeshLink {
     final session = _sessions[remoteId];
     if (session == null) {
       throw StateError('MeshLink: no established session with $remoteId yet');
+    }
+    if (await trustStore.trustLevelFor(session.nodeId) == TrustLevel.blocked) {
+      _sessions.remove(remoteId);
+      throw StateError('MeshLink: $remoteId (${session.nodeId}) is blocked');
     }
     final envelope = await identity.encryptFor(plaintext, session.agreementPublicKey);
     final tempSourceId = await identity.temporaryIdBytes();
