@@ -4,10 +4,19 @@
          NearbyPermissions; these declarations are what make those
          requests possible at all. -->
 
-    <!-- Android 12+ (API 31+) Bluetooth permissions -->
+    <!-- Android 12+ (API 31+) Bluetooth permissions -- also cover
+         mesh_transport_ble (CP8, BlePermissions): the plugin's own
+         manifest declares nothing itself and relies entirely on the
+         host app for these. -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- BLE peripheral mode (GATT server, mesh_transport_ble) needs the
+         hardware feature declared explicitly; not required so the app
+         still installs on BLE-less devices (falls back to whatever
+         other transports are available). -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <!-- Pre-Android 12 Bluetooth permissions, superseded above but still
          needed on older devices -->

@@ -17,18 +17,19 @@ mesh.messages.listen((msg) => ...);
 
 ## Status
 
-🚧 Early development — **Checkpoints 0–7 done in code** (project scaffolding; identity & crypto core; packet layer; Nearby Connections transport; the public `MeshOS` facade with reliable single-hop messaging; trust/contacts/QR exchange with SQLite persistence; multi-hop routing with flooding, store-and-forward, and end-to-end ack; broadcast + topic pub/sub + resumable file transfer). None of CP3–CP7's on-device demos — real phones actually discovering, chatting, exchanging QR codes, relaying for each other, broadcasting, and transferring files — have been run yet; see "Try it" below. **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
+🚧 Early development — **Checkpoints 0–8 done in code** (project scaffolding; identity & crypto core; packet layer; Nearby Connections transport; the public `MeshOS` facade with reliable single-hop messaging; trust/contacts/QR exchange with SQLite persistence; multi-hop routing with flooding, store-and-forward, and end-to-end ack; broadcast + topic pub/sub + resumable file transfer; a second transport (BLE) with automatic selection between it and Nearby). None of CP3–CP8's on-device demos — real phones actually discovering, chatting, exchanging QR codes, relaying for each other, broadcasting, transferring files, and falling back to BLE — have been run yet; see "Try it" below. **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
 
 ## Repo layout
 
 ```
-packages/mesh_core/            pure-Dart SDK core: identity, crypto, packets, transport-agnostic session handshake, trust primitives
-packages/mesh_os/              public SDK: the MeshOS facade -- mesh_core + a transport + platform storage (secure storage, SQLite via drift)
+packages/mesh_core/            pure-Dart SDK core: identity, crypto, packets, transport-agnostic session handshake, trust primitives, MultiTransport
+packages/mesh_os/              public SDK: the MeshOS facade -- mesh_core + transports + platform storage (secure storage, SQLite via drift)
 packages/mesh_transport_nearby/ Transport implementation over Google Nearby Connections (Android)
+packages/mesh_transport_ble/   Transport implementation over Bluetooth Low Energy (Android) -- reaches devices without Google Play services
 apps/mesh_console/             dev/demo Flutter app (not a product) -- uses the MeshOS facade, not the pieces directly
 ```
 
-Root `pubspec.yaml` is a Dart pub workspace — `flutter pub get` once at the repo root resolves all four packages.
+Root `pubspec.yaml` is a Dart pub workspace — `flutter pub get` once at the repo root resolves all five packages.
 
 ## Try it
 
@@ -36,7 +37,7 @@ Everything that runs without hardware:
 
 ```
 flutter pub get                          # from repo root
-(cd packages/mesh_core && dart test)     # 105 unit tests: identity/crypto/packets/session/delivery/trust/routing/broadcast/pub-sub/file-transfer (CP1-CP7)
+(cd packages/mesh_core && dart test)     # 116 unit tests: identity/crypto/packets/session/delivery/trust/routing/broadcast/pub-sub/file-transfer/multi-transport (CP1-CP8)
 (cd packages/mesh_os && flutter test)    # 7 unit tests: DriftTrustStore against real in-memory SQLite
 flutter analyze                          # whole workspace
 (cd packages/mesh_core && dart run example/identity_demo.dart)  # see the crypto core in action
@@ -67,7 +68,13 @@ The CP7 demo, back to two phones (broadcast) plus the same third-phone setup abo
 2. Open a chat with a trusted/known peer and tap the paperclip icon -- pick a photo from the gallery. It should appear as an outgoing bubble on the sender's screen with a live progress bar, and arrive on the peer's screen as an inline image once complete.
 3. Mid-transfer (pick a larger photo, or a slower/farther connection, to give yourself a window), walk the two phones out of range of each other. The sender's bubble should show "paused" partway through. Walk back into range -- the transfer should resume from where it left off (not restart) and finish, with the full image arriving correctly on the receiving phone.
 
-`apps/mesh_console` no longer touches `mesh_transport_nearby` directly (that was a CP3-only shortcut) -- it only calls `MeshOS`, same as any other app built on the SDK would.
+The CP8 demo, two phones, needs Android's Bluetooth (and, on one phone, a way to disable Nearby specifically -- e.g. toggling Wi-Fi off, since Nearby needs it for its bandwidth upgrade, while BLE doesn't):
+
+1. With both phones fully enabled (Bluetooth + Wi-Fi), `flutter run` on both -- everything should behave exactly like the CP3-CP7 demos above; you shouldn't be able to tell Nearby and BLE apart from the UI, which is the point.
+2. On one phone, disable whatever it takes to make Nearby Connections fail on this device (airplane mode + Bluetooth-only re-enable is one way; Nearby needs more than Bluetooth to fully function, BLE doesn't). The two phones should still find each other and chat -- confirming `MultiTransport` actually fell back to `BleTransport`, not just that Nearby was still secretly working.
+3. With both phones fully enabled again, send a large file (a big photo, or several) between them and casually time it, then repeat after forcing BLE-only on one side as in step 2. The BLE-only transfer should be noticeably slower -- confirming `MultiTransport` really does prefer the higher-bandwidth transport when both are available, not picking arbitrarily.
+
+`apps/mesh_console` no longer touches `mesh_transport_nearby` directly (that was a CP3-only shortcut) -- it only calls `MeshOS`, same as any other app built on the SDK would. Checkpoint 8's transport swap (`MultiTransport([NearbyTransport(), BleTransport()])` instead of `NearbyTransport()` alone) happens entirely inside `MeshOS.start()` -- `mesh_console` needed zero changes for it.
 
 ## Documentation
 

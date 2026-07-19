@@ -131,13 +131,19 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 ---
 
-## Checkpoint 8 — Second transport: BLE + automatic transport selection (= PDF Phase 5)
+## Checkpoint 8 — Second transport: BLE + automatic transport selection (= PDF Phase 5) ✅ code done, on-device demo still needed
 
-- [ ] `mesh_transport_ble` (Android): GATT server/client, advertising, MTU negotiation — covers devices without Google Play services, and pre-builds the interop path for when iOS support returns.
-- [ ] Transport abstraction runs multiple transports side by side and picks the best available link automatically (Nearby for bandwidth, BLE for reach).
-- [ ] Spike `bluetooth_low_energy` plugin for peripheral mode; fallback = own platform channels.
+**Goal:** reach the devices Nearby Connections can't (no Google Play services), and stop needing two separate demo builds for two separate radios.
 
-**Exit criterion (demo):** with Nearby disabled on one device, the pair still exchanges messages over BLE; with both enabled, a large payload measurably picks the faster transport.
+- [x] `mesh_transport_ble` (Android): GATT server/client, advertising, MTU negotiation. (`packages/mesh_transport_ble/lib/src/ble_transport.dart`) Built on the `bluetooth_low_energy` plugin, which supports both central and peripheral roles -- every MeshOS node runs both at once, same "every node is an equal peer" principle as `NearbyTransport`. The "spike the plugin, fall back to custom platform channels" from the original plan didn't need its fallback.
+- [x] Transport abstraction (`MultiTransport`, `packages/mesh_core/lib/src/transport/multi_transport.dart`) runs multiple transports side by side and picks the best available link automatically: correlates a peer discovered on more than one transport into a single logical device (via the already-advertised rotating `TemporaryId`, no new protocol needed), and `connect` commits to the first transport (by preference order) with a discovered path -- Nearby first for bandwidth, BLE second for reach. `MeshOS.start()` now constructs `MultiTransport([NearbyTransport(), BleTransport()])`.
+- [x] `mesh_console` needs no changes at all for this -- it was already built against the `MeshOS` facade, not `mesh_transport_nearby` directly (a CP3-only shortcut removed back in CP4), so the transport swap underneath it is entirely invisible.
+
+**Known limitations, documented honestly:** `Transport.maxPayloadSize` is connection-agnostic, so `MultiTransport` reports the minimum across every underlying transport (correct, not maximally efficient -- see ARCHITECTURE.md §7). No dynamic mid-session transport upgrade (once `connect` picks one, that's the link for the session). `BleTransport.maxPayloadSize` is fixed at BLE's un-negotiated default MTU floor (20 bytes) rather than the real negotiated value, for the same single-property-interface reason. Legacy BLE advertising's 31-byte cap interacting with a full 128-bit custom service UUID is a real, unverified-without-hardware risk (ARCHITECTURE.md §11).
+
+**Test coverage (no hardware needed):** 11 new tests in `packages/mesh_core` (116 total) in `test/transport/multi_transport_test.dart` -- discovery merging across two simulated "radios" into one device, transport preference order, fallback when the preferred transport has no path, a full connect+send+receive round trip, an inbound connection with no prior discovery still getting a working (fallback) synthetic id, disconnect targeting the right underlying transport, and one transport throwing on every call not blocking the other. `FakeTransport`/`FakeTransportNetwork` gained a settable `name` (to distinguish simulated transports) and a `lost` device event on `stopAdvertising` (previously unsupported) as part of this.
+
+**Exit criterion (demo):** with Nearby disabled on one device, the pair still exchanges messages over BLE; with both enabled, a large payload measurably picks the faster transport. **Not yet run on real hardware** -- `MultiTransport`'s selection/merging logic is fully proven against simulated transports, but `BleTransport` itself (GATT server/client, advertising, MTU negotiation, legacy-advertising byte budget) has zero real-radio verification, same category of gap as `NearbyTransport` was through CP3-CP5. See README.md.
 
 ---
 

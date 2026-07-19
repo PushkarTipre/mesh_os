@@ -20,6 +20,7 @@ export 'src/routing/relay_policy.dart';
 export 'src/session/mesh_link.dart';
 export 'src/session/peer_session.dart';
 
+export 'src/transport/multi_transport.dart';
 export 'src/transport/transport.dart';
 
 export 'src/trust/contact.dart';

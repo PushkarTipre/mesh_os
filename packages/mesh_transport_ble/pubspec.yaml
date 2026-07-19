@@ -1,0 +1,26 @@
+name: mesh_transport_ble
+description: >
+  MeshOS Transport implementation backed by Bluetooth Low Energy (Android).
+  Thin platform-adapter -- protocol logic (handshake, encryption, routing)
+  lives in mesh_core and is transport-agnostic. Covers devices without
+  Google Play services and pre-builds the Android<->iOS interop path for
+  when iOS support returns.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.4
+
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mesh_core:
+    path: ../mesh_core
+  bluetooth_low_energy: ^6.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0

@@ -15,7 +15,13 @@ class FakeTransportNetwork {
   }
 
   void _stopAdvertising(String localId) {
-    _advertising.remove(localId);
+    final advertiser = _advertising.remove(localId);
+    if (advertiser == null) return;
+    for (final discoverer in _discovering) {
+      if (discoverer != advertiser) {
+        discoverer._onPeerLost(localId);
+      }
+    }
   }
 
   void _startDiscovery(FakeTransport transport) {
@@ -38,7 +44,7 @@ class FakeTransportNetwork {
 /// real radio. Lets the session/handshake layer (and eventually a full
 /// simulated mesh) be unit tested without any hardware.
 class FakeTransport implements Transport {
-  FakeTransport(this.network, {this.maxPayloadSize = 32000});
+  FakeTransport(this.network, {this.maxPayloadSize = 32000, this.name = 'fake'});
 
   final FakeTransportNetwork network;
 
@@ -46,7 +52,7 @@ class FakeTransport implements Transport {
   final int maxPayloadSize;
 
   @override
-  String get name => 'fake';
+  final String name;
 
   String? _localId;
   final Map<String, FakeTransport> _pendingIncoming = {};
@@ -97,6 +103,10 @@ class FakeTransport implements Transport {
     _deviceEvents.add(
       DeviceEvent(remoteId: remoteId, type: DeviceEventType.found, advertisedName: remoteId),
     );
+  }
+
+  void _onPeerLost(String remoteId) {
+    _deviceEvents.add(DeviceEvent(remoteId: remoteId, type: DeviceEventType.lost));
   }
 
   @override

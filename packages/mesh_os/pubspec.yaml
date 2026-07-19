@@ -17,6 +17,8 @@ dependencies:
     path: ../mesh_core
   mesh_transport_nearby:
     path: ../mesh_transport_nearby
+  mesh_transport_ble:
+    path: ../mesh_transport_ble
   flutter_secure_storage: ^9.2.2
   drift: ^2.21.0
   drift_flutter: ^0.2.4

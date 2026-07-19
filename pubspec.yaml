@@ -8,4 +8,5 @@ workspace:
   - packages/mesh_core
   - packages/mesh_os
   - packages/mesh_transport_nearby
+  - packages/mesh_transport_ble
   - apps/mesh_console

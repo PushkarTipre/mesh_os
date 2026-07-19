@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:mesh_core/mesh_core.dart';
+import 'package:mesh_transport_ble/mesh_transport_ble.dart';
 import 'package:mesh_transport_nearby/mesh_transport_nearby.dart';
 
 import 'mesh_device.dart';
@@ -25,18 +26,22 @@ import 'storage/drift_trust_store.dart';
 /// ```
 ///
 /// Wraps `mesh_core`'s [MeshLink] (handshake, crypto, reliability, trust
-/// enforcement, multi-hop routing) and `mesh_transport_nearby`'s
-/// [NearbyTransport] rather than reimplementing anything -- this class is
-/// glue, not logic. Every discovered MeshOS peer is connected to
-/// automatically, and every incoming connection request is auto-accepted;
-/// gating *whether to connect at all* behind trust/relay policy is a
-/// later checkpoint (ARCHITECTURE.md §5, §18), not yet implemented. What's
-/// gated today: once connected, a [TrustLevel.blocked] peer is refused a
-/// session (or dropped from one); only [TrustLevel.trusted] peers ever
-/// have a [MeshDevice.displayName]; and [send] transparently routes
-/// through relays (flooding + store-and-forward, Checkpoint 6) when the
-/// destination isn't a direct neighbor, so callers never need to know how
-/// many hops a message takes.
+/// enforcement, multi-hop routing) rather than reimplementing anything --
+/// this class is glue, not logic. As of Checkpoint 8, [start] runs two
+/// transports side by side behind `mesh_core`'s [MultiTransport]:
+/// `mesh_transport_nearby`'s [NearbyTransport] (preferred, for bandwidth)
+/// and `mesh_transport_ble`'s [BleTransport] (fallback -- reaches devices
+/// without Google Play services, and pre-builds the Android<->iOS interop
+/// path for when iOS support returns). Every discovered MeshOS peer is
+/// connected to automatically, and every incoming connection request is
+/// auto-accepted; gating *whether to connect at all* behind trust/relay
+/// policy is a later checkpoint (ARCHITECTURE.md §5, §18), not yet
+/// implemented. What's gated today: once connected, a [TrustLevel.blocked]
+/// peer is refused a session (or dropped from one); only
+/// [TrustLevel.trusted] peers ever have a [MeshDevice.displayName]; and
+/// [send] transparently routes through relays (flooding + store-and-forward,
+/// Checkpoint 6) when the destination isn't a direct neighbor, so callers
+/// never need to know how many hops a message takes.
 class MeshOS {
   MeshOS({IdentityStore? identityStore, TrustStore? trustStore})
       : _identityStore = identityStore ?? SecureStorageIdentityStore(),
@@ -128,8 +133,13 @@ class MeshOS {
     _started = true;
 
     await NearbyPermissions.requestAll();
+    await BlePermissions.requestAll();
 
-    final transport = NearbyTransport();
+    // Nearby listed first: MultiTransport.connect prefers earlier
+    // entries, and Nearby has the higher bandwidth ceiling of the two
+    // (ARCHITECTURE.md §11). BLE is what still works on devices without
+    // Google Play services, or if Nearby is unavailable for any reason.
+    final transport = MultiTransport([NearbyTransport(), BleTransport()]);
     final link = MeshLink(transport: transport, identity: identity, trustStore: _trustStore)
       ..start();
     _transport = transport;
