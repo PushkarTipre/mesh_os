@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
@@ -38,11 +39,17 @@ bool _bytesEqual(List<int> a, List<int> b) {
   return true;
 }
 
-/// A message received from a peer, already signature-verified and
-/// decrypted -- whether it arrived directly or through one or more
-/// relays.
+/// A message received from a peer, already signature-verified -- and, for
+/// a private message, decrypted -- whether it arrived directly or
+/// through one or more relays.
 class InboundMessage {
-  const InboundMessage({required this.senderNodeId, required this.plaintext, this.remoteId});
+  const InboundMessage({
+    required this.senderNodeId,
+    required this.plaintext,
+    this.remoteId,
+    this.topic,
+    this.isFileChunk = false,
+  });
 
   /// The sender's permanent, stable Node ID. Always populated, regardless
   /// of hop count -- use this, not [remoteId], to identify who sent it.
@@ -51,9 +58,23 @@ class InboundMessage {
   final Uint8List plaintext;
 
   /// The transport-level connection this arrived on: the sender
-  /// themselves for a direct message, or null for a routed one (there's
-  /// no live connection to the original sender in that case).
+  /// themselves for a direct message, or null for a routed or
+  /// broadcast/publish one (there's no single live connection to
+  /// attribute those to).
   final String? remoteId;
+
+  /// Null for an ordinary private (direct/routed) message. Non-null for
+  /// broadcast/publish traffic (Checkpoint 7): `''` for a plain broadcast
+  /// ([MeshLink.broadcast]), non-empty for a topic publish
+  /// ([MeshLink.publish]) this node is either subscribed to or seeing as
+  /// an unfiltered plain broadcast.
+  final String? topic;
+
+  /// True if this arrived as a [PacketType.file] chunk -- consumed by
+  /// `FileTransferManager`; other listeners on [MeshLink.messages] should
+  /// generally ignore chunks (a file transfer's raw bytes aren't
+  /// meaningful outside reassembly).
+  final bool isFileChunk;
 }
 
 /// Outcome of a [MeshLink.sendData]/[MeshLink.sendToNode] call.
@@ -166,6 +187,11 @@ class MeshLink {
   final PacketDedupCache _dedupCache = PacketDedupCache();
   final StreamController<InboundMessage> _messages = StreamController.broadcast();
   final StreamController<String> _sessionEstablished = StreamController.broadcast();
+
+  /// Topics this node wants to see [publish]ed traffic for, beyond plain
+  /// (topic-less) broadcasts, which are always surfaced. Checkpoint 7 --
+  /// see [subscribe].
+  final Set<String> _subscribedTopics = {};
 
   StreamSubscription<ConnectionEvent>? _connectionSub;
   StreamSubscription<DataEvent>? _dataSub;
@@ -292,7 +318,16 @@ class MeshLink {
     final session = _sessions[event.remoteId];
     if (session == null) return; // no key material for this peer yet
 
-    if (packet.type != PacketType.data && packet.type != PacketType.ack) return;
+    if (packet.type == PacketType.broadcast) {
+      await _handleBroadcast(event.remoteId, packet);
+      return;
+    }
+
+    if (packet.type != PacketType.data &&
+        packet.type != PacketType.ack &&
+        packet.type != PacketType.file) {
+      return;
+    }
 
     // A direct send/ack (sendData/_sendAck) always addresses tempDestId
     // as broadcastDestination -- there's no routing address to check,
@@ -323,11 +358,12 @@ class MeshLink {
 
     switch (packet.type) {
       case PacketType.data:
+      case PacketType.file:
         await _handleData(event.remoteId, packet, session);
       case PacketType.ack:
         _handleAck(packet);
       default:
-        break; // unreachable -- narrowed to data/ack above
+        break; // unreachable -- narrowed above
     }
   }
 
@@ -409,6 +445,7 @@ class MeshLink {
         senderNodeId: session.nodeId,
         plaintext: plaintext,
         remoteId: remoteId,
+        isFileChunk: packet.type == PacketType.file,
       ));
     }
 
@@ -435,6 +472,104 @@ class MeshLink {
     if (!pending.completer.isCompleted) {
       pending.completer.complete(DeliveryStatus.delivered);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // Broadcast / topic pub-sub (Checkpoint 7)
+  // ---------------------------------------------------------------------
+
+  /// Starts surfacing [publish]ed traffic for [topic] on [messages] (in
+  /// addition to plain, topic-less broadcasts, which are always
+  /// surfaced). Purely local bookkeeping -- there's no subscription
+  /// packet sent anywhere; every subscriber-capable node sees every
+  /// broadcast/publish that reaches it regardless, and just decides
+  /// locally whether to surface or discard it. See [_handleBroadcast].
+  void subscribe(String topic) => _subscribedTopics.add(topic);
+
+  void unsubscribe(String topic) => _subscribedTopics.remove(topic);
+
+  /// Sends [plaintext] to every reachable node, self-certifying and
+  /// unencrypted (there's no single recipient to encrypt for). Flooded
+  /// with the same TTL-bounded, dedup'd relay machinery as routed
+  /// messages ([_floodOrStore]/[_relayPacket]), rather than requiring the
+  /// destination to be a known contact -- anyone can verify the
+  /// signature against the embedded public key, but nobody needs to have
+  /// met the sender before to relay or receive it.
+  Future<void> broadcast(List<int> plaintext, {int ttl = 8}) => _publish('', plaintext, ttl);
+
+  /// Like [broadcast], but tagged with [topic] so only subscribers
+  /// ([subscribe]) surface it on [messages] -- everyone else still
+  /// relays it onward (their lack of interest doesn't mean nobody
+  /// further along is subscribed).
+  Future<void> publish(String topic, List<int> plaintext, {int ttl = 8}) {
+    if (topic.isEmpty) {
+      throw ArgumentError.value(topic, 'topic', 'must not be empty -- use broadcast() instead');
+    }
+    return _publish(topic, plaintext, ttl);
+  }
+
+  Future<void> _publish(String topic, List<int> plaintext, int ttl) async {
+    final topicBytes = utf8.encode(topic);
+    if (topicBytes.length > 255) {
+      throw ArgumentError.value(topic, 'topic', 'must be at most 255 UTF-8 bytes');
+    }
+    final payload = BytesBuilder()
+      ..add(identity.signingPublicKey.bytes)
+      ..addByte(topicBytes.length)
+      ..add(topicBytes)
+      ..add(plaintext);
+    final packet = await MeshPacket.create(
+      signer: identity,
+      type: PacketType.broadcast,
+      tempSourceId: identity.routingAddress,
+      tempDestId: MeshPacket.broadcastDestination,
+      payload: payload.toBytes(),
+      ttl: ttl,
+    );
+    // We authored this; don't re-surface or re-relay our own echo if a
+    // neighbor floods it straight back to us.
+    _dedupCache.checkAndRecord(packet.packetIdHex);
+    await _floodOrStore(packet);
+  }
+
+  Future<void> _handleBroadcast(String fromRemoteId, MeshPacket packet) async {
+    final isNew = _dedupCache.checkAndRecord(packet.packetIdHex);
+    if (!isNew) return;
+
+    if (packet.payload.length < _publicKeyLength + 1) return; // malformed
+    final signingPublicKey = SimplePublicKey(
+      packet.payload.sublist(0, _publicKeyLength),
+      type: KeyPairType.ed25519,
+    );
+    final topicLength = packet.payload[_publicKeyLength];
+    final topicStart = _publicKeyLength + 1;
+    final topicEnd = topicStart + topicLength;
+    if (packet.payload.length < topicEnd) return; // malformed
+
+    // Self-certifying, same as discovery: the signature must verify
+    // against the very key embedded in the payload. This is what lets a
+    // node that's never met the sender before still trust and relay it.
+    if (!await packet.verifySignature(signingPublicKey)) return;
+
+    final topic = utf8.decode(packet.payload.sublist(topicStart, topicEnd));
+    final messageBytes = Uint8List.fromList(packet.payload.sublist(topicEnd));
+    final senderNodeId = await NodeIdentity.nodeIdForSigningPublicKey(signingPublicKey);
+
+    if (topic.isEmpty || _subscribedTopics.contains(topic)) {
+      _messages.add(InboundMessage(
+        senderNodeId: senderNodeId,
+        plaintext: messageBytes,
+        topic: topic,
+      ));
+    }
+
+    // Keep propagating regardless of our own subscription -- someone
+    // further along the flood might be subscribed even if we aren't.
+    final forwarded = packet.forwarded();
+    if (forwarded == null) return; // ttl exhausted
+    if (!await _relayAllowed(fromRemoteId)) return;
+    if (!_recordRelayForRateLimit(fromRemoteId)) return;
+    await _floodOrStore(forwarded, excludeRemoteId: fromRemoteId);
   }
 
   // ---------------------------------------------------------------------
@@ -469,6 +604,7 @@ class MeshLink {
 
     switch (packet.type) {
       case PacketType.data:
+      case PacketType.file:
         await _handleRoutedData(packet, senderContact);
         return true;
       case PacketType.ack:
@@ -504,7 +640,11 @@ class MeshLink {
       return; // MAC failure / tampered payload -- drop
     }
 
-    _messages.add(InboundMessage(senderNodeId: senderContact.nodeId, plaintext: plaintext));
+    _messages.add(InboundMessage(
+      senderNodeId: senderContact.nodeId,
+      plaintext: plaintext,
+      isFileChunk: packet.type == PacketType.file,
+    ));
     await _sendRoutedAck(senderContact, packet.packetId);
   }
 
@@ -621,10 +761,14 @@ class MeshLink {
   /// later, if the destination isn't reachable yet), or
   /// [DeliveryStatus.failed] once the packet expires from the local
   /// store-and-forward cache ([storeAndForwardExpiry]) without one.
-  Future<DeliveryStatus> sendToNode(String nodeId, List<int> plaintext) async {
+  Future<DeliveryStatus> sendToNode(
+    String nodeId,
+    List<int> plaintext, {
+    PacketType type = PacketType.data,
+  }) async {
     for (final session in _sessions.values) {
       if (session.nodeId == nodeId) {
-        return sendData(session.remoteId, plaintext);
+        return sendData(session.remoteId, plaintext, type: type);
       }
     }
 
@@ -642,7 +786,7 @@ class MeshLink {
     );
     final packet = await MeshPacket.create(
       signer: identity,
-      type: PacketType.data,
+      type: type,
       tempSourceId: identity.routingAddress,
       tempDestId: destRoutingAddress,
       payload: envelope.toBytes(),
@@ -669,6 +813,7 @@ class MeshLink {
     List<int> plaintext, {
     int maxRetries = 3,
     Duration retryInterval = const Duration(seconds: 2),
+    PacketType type = PacketType.data,
   }) async {
     final session = _sessions[remoteId];
     if (session == null) {
@@ -682,7 +827,7 @@ class MeshLink {
     final tempSourceId = await identity.temporaryIdBytes();
     final packet = await MeshPacket.create(
       signer: identity,
-      type: PacketType.data,
+      type: type,
       tempSourceId: tempSourceId,
       tempDestId: MeshPacket.broadcastDestination,
       payload: envelope.toBytes(),

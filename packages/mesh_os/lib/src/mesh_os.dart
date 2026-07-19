@@ -48,6 +48,7 @@ class MeshOS {
   NodeIdentity? _identity;
   Transport? _transport;
   MeshLink? _link;
+  FileTransferManager? _fileTransfers;
   bool _started = false;
 
   final Map<String, MeshDevice> _devices = {};
@@ -79,12 +80,33 @@ class MeshOS {
   /// Emits the full device list every time it changes.
   Stream<List<MeshDevice>> get deviceUpdates => _devicesController.stream;
 
-  /// Verified, decrypted incoming messages from any peer, direct or
-  /// routed through relays. [InboundMessage.senderNodeId] is always
+  /// Verified, decrypted incoming messages from any peer -- direct,
+  /// routed through relays, or broadcast/published ([InboundMessage.topic]
+  /// is non-null for the latter). [InboundMessage.senderNodeId] is always
   /// populated (use it, not [InboundMessage.remoteId], for things like
-  /// persisted chat history -- `remoteId` is null for a routed message,
-  /// since there's no live connection to the original sender).
+  /// persisted chat history -- `remoteId` is null for a routed or
+  /// broadcast/publish message, since there's no single live connection
+  /// to attribute it to). File transfer chunks ([PacketType.file]) never
+  /// appear here -- see [incomingFiles] instead.
   Stream<InboundMessage> get messages => _messagesController.stream;
+
+  /// Progress updates for files this device is sending -- see [sendFile].
+  Stream<FileTransferProgress> get outgoingFileProgress {
+    final transfers = _fileTransfers;
+    if (transfers == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    return transfers.outgoingProgress;
+  }
+
+  /// Fully reassembled files received from peers.
+  Stream<IncomingFile> get incomingFiles {
+    final transfers = _fileTransfers;
+    if (transfers == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    return transfers.incomingFiles;
+  }
 
   /// Every contact this device has ever interacted with, regardless of
   /// whether they're currently nearby (ARCHITECTURE.md §4, §9).
@@ -112,11 +134,19 @@ class MeshOS {
       ..start();
     _transport = transport;
     _link = link;
+    _fileTransfers = FileTransferManager(link: link);
 
     _deviceSub = transport.deviceEvents.listen(_onDeviceEvent);
     _connectionSub = transport.connectionEvents.listen(_onConnectionEvent);
     _sessionSub = link.sessionEstablished.listen(_onSessionEstablished);
-    _messageSub = link.messages.listen(_messagesController.add);
+    // File-transfer chunks are internal plumbing (FileTransferManager
+    // already consumed them above) -- an app listening on [messages]
+    // wants chat/broadcast traffic, not raw chunk bytes. See
+    // [incomingFiles] for reassembled files instead.
+    _messageSub = link.messages.listen((message) {
+      if (message.isFileChunk) return;
+      _messagesController.add(message);
+    });
     _contactSub = _trustStore.watchContacts().listen(_onContactsChanged);
 
     final tempId = await identity.temporaryId();
@@ -244,6 +274,68 @@ class MeshOS {
     return link.sendToNode(destination, payload);
   }
 
+  /// Sends [payload] to every reachable node, self-certifying and
+  /// unencrypted -- there's no destination to be a known contact of, and
+  /// no encryption key to have on file for them. See [MeshLink.broadcast].
+  Future<void> broadcast(List<int> payload, {int ttl = 8}) {
+    final link = _link;
+    if (link == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    return link.broadcast(payload, ttl: ttl);
+  }
+
+  /// Like [broadcast], but tagged with [topic] so only [subscribe]d
+  /// listeners surface it on [messages]. See [MeshLink.publish].
+  Future<void> publish(String topic, List<int> payload, {int ttl = 8}) {
+    final link = _link;
+    if (link == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    return link.publish(topic, payload, ttl: ttl);
+  }
+
+  /// Starts surfacing [publish]ed traffic for [topic] on [messages], in
+  /// addition to plain broadcasts (always surfaced).
+  void subscribe(String topic) {
+    final link = _link;
+    if (link == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    link.subscribe(topic);
+  }
+
+  void unsubscribe(String topic) {
+    final link = _link;
+    if (link == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    link.unsubscribe(topic);
+  }
+
+  /// Starts sending [bytes] to [destination] as [filename], chunked and
+  /// sent via the same reliable delivery [send] uses. Returns immediately
+  /// with a transfer id; track progress via [outgoingFileProgress].
+  /// Requires [destination] to already be a known contact, same as
+  /// [send].
+  String sendFile({
+    required String destination,
+    required String filename,
+    required Uint8List bytes,
+    int chunkSize = 16 * 1024,
+  }) {
+    final transfers = _fileTransfers;
+    if (transfers == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    return transfers.sendFile(
+      nodeId: destination,
+      filename: filename,
+      bytes: bytes,
+      chunkSize: chunkSize,
+    );
+  }
+
   /// Resolves a live [InboundMessage.remoteId] (or [MeshDevice.remoteId])
   /// to the peer's stable, permanent Node ID -- use this, not remoteId,
   /// as a persistence key (e.g. chat history), since remoteId changes
@@ -323,6 +415,7 @@ class MeshOS {
     await _sessionSub?.cancel();
     await _messageSub?.cancel();
     await _contactSub?.cancel();
+    await _fileTransfers?.dispose();
     await _link?.dispose();
     await _transport?.dispose();
     await _devicesController.close();

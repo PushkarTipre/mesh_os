@@ -3,6 +3,8 @@ export 'src/identity/identity_store.dart';
 export 'src/identity/node_identity.dart';
 export 'src/identity/temporary_id.dart';
 
+export 'src/files/file_transfer.dart';
+
 export 'src/packet/crc32.dart';
 export 'src/packet/fragment.dart';
 export 'src/packet/fragmenter.dart';

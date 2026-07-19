@@ -17,7 +17,7 @@ mesh.messages.listen((msg) => ...);
 
 ## Status
 
-🚧 Early development — **Checkpoints 0–6 done in code** (project scaffolding; identity & crypto core; packet layer; Nearby Connections transport; the public `MeshOS` facade with reliable single-hop messaging; trust/contacts/QR exchange with SQLite persistence; multi-hop routing with flooding, store-and-forward, and end-to-end ack). None of CP3–CP6's on-device demos — real phones actually discovering, chatting, exchanging QR codes, and relaying for each other — have been run yet; see "Try it" below. **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
+🚧 Early development — **Checkpoints 0–7 done in code** (project scaffolding; identity & crypto core; packet layer; Nearby Connections transport; the public `MeshOS` facade with reliable single-hop messaging; trust/contacts/QR exchange with SQLite persistence; multi-hop routing with flooding, store-and-forward, and end-to-end ack; broadcast + topic pub/sub + resumable file transfer). None of CP3–CP7's on-device demos — real phones actually discovering, chatting, exchanging QR codes, relaying for each other, broadcasting, and transferring files — have been run yet; see "Try it" below. **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
 
 ## Repo layout
 
@@ -36,7 +36,7 @@ Everything that runs without hardware:
 
 ```
 flutter pub get                          # from repo root
-(cd packages/mesh_core && dart test)     # 92 unit tests: identity/crypto/packets/session/delivery/trust/routing (CP1-CP6)
+(cd packages/mesh_core && dart test)     # 105 unit tests: identity/crypto/packets/session/delivery/trust/routing/broadcast/pub-sub/file-transfer (CP1-CP7)
 (cd packages/mesh_os && flutter test)    # 7 unit tests: DriftTrustStore against real in-memory SQLite
 flutter analyze                          # whole workspace
 (cd packages/mesh_core && dart run example/identity_demo.dart)  # see the crypto core in action
@@ -60,6 +60,12 @@ The CP6 demo, which needs a **third** phone (this is the first checkpoint where 
 3. On A, phone C should now appear under a new **"Other known contacts"** section (not "Nearby devices" — A and C aren't in direct range). Tap it to open the same chat screen as before.
 4. Send a message from A. It should still arrive on C, routed through B, and A's copy should still flip to "delivered" once C's ack makes it back — same as the direct case, just slower and via a third phone neither UI surfaces explicitly (that's the point: `MeshOS.send()` doesn't ask which path to use).
 5. Turn phone C off entirely. Send another message from A to C. It should sit as "sending" -- B is holding it in its own store-and-forward cache. Turn C back on within range of B (A can stay out of range the whole time) -- the message should arrive on C, and A's copy should flip to "delivered" once C's ack finds its way back.
+
+The CP7 demo, back to two phones (broadcast) plus the same third-phone setup above if you want to confirm a broadcast crosses a relay too:
+
+1. On both phones, tap the megaphone icon in the app bar to open the Broadcast screen. Type a message on phone A and send it -- it should appear on phone B's Broadcast screen within moments, with A's Node ID as sender, even if A and B have never exchanged QR codes or chatted before (broadcast needs no prior contact).
+2. Open a chat with a trusted/known peer and tap the paperclip icon -- pick a photo from the gallery. It should appear as an outgoing bubble on the sender's screen with a live progress bar, and arrive on the peer's screen as an inline image once complete.
+3. Mid-transfer (pick a larger photo, or a slower/farther connection, to give yourself a window), walk the two phones out of range of each other. The sender's bubble should show "paused" partway through. Walk back into range -- the transfer should resume from where it left off (not restart) and finish, with the full image arriving correctly on the receiving phone.
 
 `apps/mesh_console` no longer touches `mesh_transport_nearby` directly (that was a CP3-only shortcut) -- it only calls `MeshOS`, same as any other app built on the SDK would.
 

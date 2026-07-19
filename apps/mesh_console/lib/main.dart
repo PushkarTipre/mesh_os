@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:mesh_os/mesh_os.dart';
 
+import 'broadcast_screen.dart';
 import 'chat_history.dart';
 import 'identity_card_screens.dart';
 
@@ -104,6 +107,12 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<void> _showBroadcast() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => BroadcastScreen(mesh: _mesh)),
+    );
+  }
+
   Future<void> _setTrustLevel(String nodeId, TrustLevel level) async {
     switch (level) {
       case TrustLevel.trusted:
@@ -123,6 +132,7 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('MeshOS Console'),
         actions: [
+          IconButton(icon: const Icon(Icons.campaign), onPressed: _showBroadcast),
           IconButton(icon: const Icon(Icons.qr_code), onPressed: _showMyCode),
           IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: _scanCode),
         ],
@@ -276,19 +286,31 @@ class _ChatScreenState extends State<ChatScreen> {
   final ScrollController _scrollController = ScrollController();
   final List<ChatMessageRecord> _messages = [];
 
+  // File transfers are session-only (not persisted to ChatHistoryStore,
+  // unlike text messages) -- a dev-harness scope decision, not a platform
+  // limitation; see ROADMAP.md Checkpoint 7's notes.
+  final List<_FileEvent> _fileEvents = [];
+  final Map<String, _FileEvent> _outgoingTransfers = {};
+
   Map<String, List<ChatMessageRecord>> _allHistory = {};
   StreamSubscription<InboundMessage>? _messageSub;
+  StreamSubscription<IncomingFile>? _fileSub;
+  StreamSubscription<FileTransferProgress>? _progressSub;
 
   @override
   void initState() {
     super.initState();
     _loadHistory();
     _messageSub = widget.mesh.messages.listen(_onIncoming);
+    _fileSub = widget.mesh.incomingFiles.listen(_onIncomingFile);
+    _progressSub = widget.mesh.outgoingFileProgress.listen(_onOutgoingProgress);
   }
 
   @override
   void dispose() {
     _messageSub?.cancel();
+    _fileSub?.cancel();
+    _progressSub?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -309,8 +331,11 @@ class _ChatScreenState extends State<ChatScreen> {
   void _onIncoming(InboundMessage message) {
     // senderNodeId is always populated, whether the message arrived
     // directly or was routed through relays (Checkpoint 6) -- unlike
-    // remoteId, which is null for a routed message.
-    if (message.senderNodeId != widget.peerNodeId) return;
+    // remoteId, which is null for a routed message. A non-null topic
+    // means this is broadcast/publish traffic (Checkpoint 7), which
+    // belongs in BroadcastScreen's feed, not a private chat thread, even
+    // if it happens to come from this peer.
+    if (message.senderNodeId != widget.peerNodeId || message.topic != null) return;
     setState(() {
       _messages.add(
         ChatMessageRecord(
@@ -322,6 +347,47 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     });
     unawaited(_persist());
+    _scrollToBottom();
+  }
+
+  void _onIncomingFile(IncomingFile file) {
+    if (file.senderNodeId != widget.peerNodeId) return;
+    setState(() {
+      _fileEvents.add(_FileEvent(
+        outgoing: false,
+        filename: file.filename,
+        timestamp: DateTime.now(),
+        localBytes: file.bytes,
+      ));
+    });
+    _scrollToBottom();
+  }
+
+  void _onOutgoingProgress(FileTransferProgress progress) {
+    final event = _outgoingTransfers[progress.transferId];
+    if (event == null) return; // not a transfer this screen started
+    setState(() => event.progress = progress);
+  }
+
+  Future<void> _pickAndSendFile() async {
+    final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+
+    final transferId = widget.mesh.sendFile(
+      destination: widget.peerNodeId,
+      filename: picked.name,
+      bytes: bytes,
+    );
+
+    final event = _FileEvent(
+      outgoing: true,
+      filename: picked.name,
+      timestamp: DateTime.now(),
+      localBytes: bytes,
+    );
+    _outgoingTransfers[transferId] = event;
+    setState(() => _fileEvents.add(event));
     _scrollToBottom();
   }
 
@@ -383,18 +449,31 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: ListView.builder(
-              controller: _scrollController,
-              padding: const EdgeInsets.all(12),
-              itemCount: _messages.length,
-              itemBuilder: (context, index) => _buildBubble(_messages[index]),
-            ),
+            child: Builder(builder: (context) {
+              final items = <_ChatItem>[
+                ..._messages.map(_TextChatItem.new),
+                ..._fileEvents.map(_FileChatItem.new),
+              ]..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+              return ListView.builder(
+                controller: _scrollController,
+                padding: const EdgeInsets.all(12),
+                itemCount: items.length,
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  return switch (item) {
+                    _TextChatItem() => _buildBubble(item.record),
+                    _FileChatItem() => _buildFileBubble(item.event),
+                  };
+                },
+              );
+            }),
           ),
           const Divider(height: 1),
           Padding(
             padding: const EdgeInsets.all(8),
             child: Row(
               children: [
+                IconButton(icon: const Icon(Icons.attach_file), onPressed: _pickAndSendFile),
                 Expanded(
                   child: TextField(
                     controller: _textController,
@@ -436,4 +515,110 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
   }
+
+  Widget _buildFileBubble(_FileEvent event) {
+    final progress = event.progress;
+    final statusText = !event.outgoing
+        ? 'received'
+        : switch (progress?.status) {
+            null => 'sending',
+            FileTransferStatus.inProgress => 'sending ${(progress!.fraction * 100).round()}%',
+            FileTransferStatus.paused => 'paused ${(progress!.fraction * 100).round()}%',
+            FileTransferStatus.completed => 'delivered',
+          };
+
+    return Align(
+      alignment: event.outgoing ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.all(8),
+        constraints: const BoxConstraints(maxWidth: 220),
+        decoration: BoxDecoration(
+          color: event.outgoing ? Colors.blue.shade100 : Colors.grey.shade200,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (event.looksLikeImage && event.localBytes != null)
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Image.memory(event.localBytes!, fit: BoxFit.cover),
+              )
+            else
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.insert_drive_file, size: 20),
+                  const SizedBox(width: 6),
+                  Flexible(child: Text(event.filename, overflow: TextOverflow.ellipsis)),
+                ],
+              ),
+            const SizedBox(height: 4),
+            Text(statusText, style: const TextStyle(fontSize: 10, color: Colors.black54)),
+            if (event.outgoing &&
+                progress != null &&
+                progress.status != FileTransferStatus.completed)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: LinearProgressIndicator(value: progress.fraction),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A file sent or received in this chat -- kept separate from
+/// [ChatMessageRecord] since file bytes aren't persisted (session-only,
+/// see [_ChatScreenState]'s field doc).
+class _FileEvent {
+  _FileEvent({
+    required this.outgoing,
+    required this.filename,
+    required this.timestamp,
+    this.localBytes,
+  });
+
+  final bool outgoing;
+  final String filename;
+  final DateTime timestamp;
+  final Uint8List? localBytes;
+
+  /// Only ever set for an outgoing transfer -- see
+  /// [_ChatScreenState._onOutgoingProgress].
+  FileTransferProgress? progress;
+
+  bool get looksLikeImage {
+    final lower = filename.toLowerCase();
+    return lower.endsWith('.png') ||
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.gif') ||
+        lower.endsWith('.webp');
+  }
+}
+
+/// Text messages ([ChatMessageRecord]) and file transfers ([_FileEvent])
+/// are tracked in separate lists (different persistence lifetimes) but
+/// rendered as one chronological feed -- this is the shared view over
+/// both, sorted by [timestamp] just before building the list.
+sealed class _ChatItem {
+  DateTime get timestamp;
+}
+
+class _TextChatItem extends _ChatItem {
+  _TextChatItem(this.record);
+  final ChatMessageRecord record;
+  @override
+  DateTime get timestamp => record.timestamp;
+}
+
+class _FileChatItem extends _ChatItem {
+  _FileChatItem(this.event);
+  final _FileEvent event;
+  @override
+  DateTime get timestamp => event.timestamp;
 }

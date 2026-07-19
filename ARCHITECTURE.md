@@ -132,7 +132,7 @@ Version | Type | Packet ID | Timestamp | Temp Source ID | Temp Dest ID |
 TTL | Hop Count | Priority | Encrypted Payload | Signature | Checksum
 ```
 
-Packet types: `discovery`, `data`, `broadcast`, `ack`, `sync`, `file`, `heartbeat`.
+Packet types: `discovery`, `data`, `broadcast`, `ack`, `sync`, `file`, `heartbeat`. `broadcast` and `file` are implemented as of Checkpoint 7 (§7) -- `sync` and `heartbeat` remain reserved, unused.
 
 **Practical constraint:** every transport has a payload ceiling (Nearby Connections `BYTES` ≈ 32 KB; BLE MTU is 23–512 bytes negotiated). The transport layer must implement **fragmentation and reassembly**; the packet layer stays transport-agnostic.
 
@@ -166,6 +166,16 @@ ACKs, retries, duplicate detection (packet-ID cache), sequence numbers, expirati
 
 **End-to-end (multi-hop) implemented as of Checkpoint 6** (`MeshLink.sendToNode`): once the actual destination decrypts a routed packet, it sends its own `ack` back through the mesh (flooded/stored exactly like data traffic, addressed via routing address), which the original sender eventually receives and matches to resolve its pending `sendToNode` call. Unlike the bounded, timed retry of a direct send, a routed send has no fixed retry schedule — it just waits, resolving `delivered` whenever the ack eventually shows up (which could be much later) or `failed` once the packet expires from the local store-and-forward cache without one. `MeshOS.send()` picks whichever path applies automatically: direct if the destination is a live neighbor, routed otherwise — callers never need to know how many hops a message took.
 
+### Broadcast and topic pub/sub
+
+**Implemented as of Checkpoint 7** (`MeshLink.broadcast`/`publish`/`subscribe`, `packages/mesh_core/lib/src/session/mesh_link.dart`). A `broadcast` packet has no destination at all -- unlike `data`/`ack`, it's never addressed via `routingAddress`, it's just flooded (TTL decrement + dedup, same machinery as §7's relay path) to every reachable node. Because there's no destination to encrypt for, the payload isn't encrypted; instead it's **self-certifying**, the same trick used by the discovery handshake (§5) and `IdentityCard` (§9): the payload embeds the sender's Ed25519 public key, and the packet's signature must verify against that embedded key. This is what lets a node relay or receive a broadcast from someone it has never met -- there's no prior key exchange to require. A forged payload (embedded key that doesn't match whoever actually signed it) fails verification and is dropped, not relayed.
+
+Topic pub/sub (`publish`/`subscribe`) reuses the identical wire mechanism -- a `publish` is a `broadcast` with a UTF-8 topic tag prepended to the payload (empty tag = plain broadcast). **Subscription is local-only filtering, not topic-aware routing:** every broadcast-capable node relays every broadcast/publish it sees regardless of its own subscriptions (a node with no interest in a topic might still be the only bridge to a node that does care), and only decides whether to *surface* it to the app based on `subscribe`d topics. This keeps the routing layer simple at the cost of some wasted relay bandwidth on topics nobody nearby cares about -- an acceptable v1 trade-off, matching the flooding-based routing model's own trade-offs (§7).
+
+### File transfer
+
+**Implemented as of Checkpoint 7** (`FileTransferManager`, `packages/mesh_core/lib/src/files/file_transfer.dart`), built entirely on top of `MeshLink.sendToNode`/`sendData` rather than a parallel reliability mechanism -- a file is split into chunks (default 16 KB), each sent as an ordinary point-to-point message tagged `PacketType.file` instead of `PacketType.data` (a `type` parameter threaded through `sendData`/`sendToNode`), so it inherits direct/routed addressing, retry, and acking for free. Chunks are sent strictly in order, one at a time, each bounded to a 15s wait (rather than inheriting the routed path's up-to-24h store-and-forward default) so a stalled transfer surfaces as `FileTransferStatus.paused` promptly instead of hanging; because every attempt uses a fresh packet ID, a late ack for a timed-out attempt is simply ignored, never double-counted. A paused transfer resumes automatically, from the last acked chunk (not from scratch), the next time `MeshLink.sessionEstablished` reports a completed handshake with the same destination node -- this is what makes it survive walking out of range and back into it. **Known limitation:** transfer state (in-flight chunks, resume point) is in-memory only, like the relay store (§7) -- an app restart mid-transfer loses it; `mesh_console`'s demo UI also keeps received/sent files session-only, not written to any chat history.
+
 ---
 
 ## 8. Security model
@@ -195,11 +205,20 @@ await mesh.initialize();       // load/create identity
 await mesh.start();            // start discovery + transports
 
 await mesh.send(destination: nodeId, payload: bytes);  // direct or multi-hop, transparently -- returns DeliveryStatus
-await mesh.broadcast(bytes);                            // target: Checkpoint 7
+await mesh.broadcast(bytes);                            // fan-out to everyone within TTL, self-certifying
+await mesh.publish('topic', bytes);                     // broadcast + topic tag
+mesh.subscribe('topic');                                // surface that topic's publishes on messages
+mesh.unsubscribe('topic');
+
+final transferId = mesh.sendFile(                        // chunked, resumable, progress-tracked
+  destination: nodeId, filename: 'photo.jpg', bytes: fileBytes,
+);
+mesh.outgoingFileProgress.listen((progress) => ...);
+mesh.incomingFiles.listen((file) => ...);
 
 mesh.devices;                  // reactive list of nearby nodes
 mesh.deviceUpdates.listen((devices) => ...);
-mesh.messages.listen((msg) => ...);
+mesh.messages.listen((msg) => ...);            // chat + broadcast/publish (msg.topic != null); never file chunks
 
 await mesh.trust(nodeId);
 await mesh.block(nodeId);
@@ -208,7 +227,7 @@ await mesh.createIdentityCard(displayName: 'Pushkar');   // QR/NFC/share-code pa
 await mesh.trustFromIdentityCard(scannedPayload);        // verifies + trusts in one step
 ```
 
-`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). As of Checkpoint 6, `send` transparently routes through relays (`MeshLink.sendToNode`, §7) when the destination isn't a direct neighbor -- callers never chose "direct" vs "routed" and don't need to. `broadcast` still isn't implemented -- it's a different distribution model (fan-out to everyone within TTL, not addressed unicast delivery) and lands in Checkpoint 7.
+`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). As of Checkpoint 6, `send` transparently routes through relays (`MeshLink.sendToNode`, §7) when the destination isn't a direct neighbor -- callers never chose "direct" vs "routed" and don't need to. As of Checkpoint 7, `broadcast`/`publish`/`subscribe`/`unsubscribe`/`sendFile`/`outgoingFileProgress`/`incomingFiles` are implemented, thin wrappers over `mesh_core`'s `MeshLink` broadcast/pub-sub methods and `FileTransferManager` (§7). `messages` now filters out file-transfer chunks (`InboundMessage.isFileChunk`) before surfacing to the app -- use `incomingFiles` for those instead.
 
 ---
 

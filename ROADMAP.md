@@ -113,13 +113,21 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 ---
 
-## Checkpoint 7 — File transfer, broadcast, pub/sub (= PDF Phase 4)
+## Checkpoint 7 — File transfer, broadcast, pub/sub (= PDF Phase 4) ✅ code done, on-device demo still needed
 
-- [ ] Chunked file transfer with resume (built on `file` packets + sequence numbers).
-- [ ] `broadcast()` with TTL-bounded flooding.
-- [ ] Topic-based publish/subscribe.
+**Goal:** get bytes to everyone, or a whole file to one person, without either needing a prior encryption relationship for the former or reinventing reliability for the latter.
 
-**Exit criterion (demo):** a photo transfers between two phones offline with a progress indicator and survives an interruption mid-transfer; a broadcast reaches all 3 test devices.
+- [x] `broadcast()` with TTL-bounded flooding: self-certifying (embedded pubkey + signature, no destination to encrypt for), reuses the existing relay/dedup machinery (`MeshLink._handleBroadcast`, `packages/mesh_core/lib/src/session/mesh_link.dart`).
+- [x] Topic-based publish/subscribe (`publish`/`subscribe`/`unsubscribe`): a `publish` is a `broadcast` with a topic tag; every relay-capable node still forwards every topic regardless of its own subscriptions (local filtering only, not topic-aware routing) — see ARCHITECTURE.md §7.
+- [x] Chunked file transfer with resume (`FileTransferManager`, `packages/mesh_core/lib/src/files/file_transfer.dart`) — built entirely on `sendToNode`/`sendData` (a new `PacketType.file` tag, threaded through both) rather than a parallel reliability mechanism, so it inherits direct/routed addressing, retry, and acking for free. A stalled chunk (15s bound per attempt) pauses the transfer; it resumes automatically, from the last acked chunk, the next time `MeshLink.sessionEstablished` fires for the same destination.
+- [x] `MeshOS` facade: `broadcast`/`publish`/`subscribe`/`unsubscribe`/`sendFile`/`outgoingFileProgress`/`incomingFiles`; `messages` now filters out file chunks (`InboundMessage.isFileChunk`).
+- [x] `mesh_console` demo UI: a Broadcast screen (send/receive plain broadcasts — topic pub/sub is implemented and tested at the SDK level but not surfaced in this demo UI, to keep it thin); an attach-photo button in chat (via `image_picker`) with a progress indicator per outgoing transfer and inline image rendering for received files.
+
+**Known limitation, documented honestly:** file-transfer state (in-flight chunks, resume point) is in-memory only, like the CP6 relay store — an app restart mid-transfer loses it. `mesh_console` also keeps file messages session-only (not written to `ChatHistoryStore`, unlike text).
+
+**Test coverage (no hardware needed):** 13 new tests in `packages/mesh_core` (105 total) — 8 broadcast/pub-sub tests (3-node relay reach with no prior contact required, topic filtering, a non-subscriber still relaying for a subscriber further along, a forged-signature broadcast dropped and not relayed) in `test/routing/broadcast_test.dart`; 5 file-transfer tests (byte-exact small/multi-chunk/zero-byte transfers, ordinary chat messages never leaking into `incomingFiles`, and — the interesting one — a transfer that loses its ack, gets disconnected before the retry timer fires, pauses, then resumes and completes byte-exact after reconnecting, with no duplication despite the resend) in `test/files/file_transfer_test.dart`.
+
+**Exit criterion (demo):** a photo transfers between two phones offline with a progress indicator and survives an interruption mid-transfer; a broadcast reaches all 3 test devices. **Not yet run on real hardware** — the scenario above (including the ack-loss/pause/resume path) is proven in `packages/mesh_core`'s simulated-network test suite, but this checkpoint's actual exit demo needs physical phones with a real camera roll and a real walk-out-of-range interruption. See README.md.
 
 ---
 
