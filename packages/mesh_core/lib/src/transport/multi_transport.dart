@@ -55,7 +55,7 @@ class _PeerLink {
 ///
 /// Fully unit-testable against any [Transport] implementation, including
 /// two or more `FakeTransport`s standing in for "Nearby" and "BLE" --
-/// unlike [BleTransport]/`NearbyTransport` themselves, none of this
+/// unlike `BleTransport`/`NearbyTransport` themselves, none of this
 /// selection/merging logic touches real hardware.
 class MultiTransport implements Transport {
   MultiTransport(this.transports) {

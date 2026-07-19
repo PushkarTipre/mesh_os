@@ -103,7 +103,7 @@ class NodeIdentity {
   /// packet sits with a relay for an hour, the destination's temp ID has
   /// already rotated six times, so an address computed at send time can
   /// never match by delivery time. Multi-hop packets (`MeshLink`'s
-  /// routed-packet path) address [tempSourceId]/[tempDestId] with routing
+  /// routed-packet path) address `tempSourceId`/`tempDestId` with routing
   /// addresses instead, which trades away temp-ID's anti-tracking
   /// property for multi-hop traffic specifically: an observer who sees
   /// the same routing address recur across packets over time can infer

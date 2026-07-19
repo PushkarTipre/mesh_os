@@ -22,7 +22,8 @@ class DeviceEvent {
   String toString() => 'DeviceEvent($type, $remoteId, $advertisedName)';
 }
 
-/// A connection to [remoteId] changed state.
+/// A connection to a peer (identified by `remoteId` on [ConnectionEvent])
+/// changed state.
 enum ConnectionEventType {
   /// A peer wants to connect and is waiting for us to accept/reject.
   incomingRequest,

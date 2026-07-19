@@ -20,7 +20,7 @@ import 'packet_type.dart';
 /// fields the origin sender set and nothing else touches: [version],
 /// [type], [packetId], [timestamp], [tempSourceId], [tempDestId],
 /// [priority], and [payload]. [ttl] and [hopCount] are deliberately
-/// excluded from the signed data (see [_signableBytes]); [checksum] is a
+/// excluded from the signed data (see [_signableBytes]); the checksum is a
 /// separate, unsigned, per-hop transmission-integrity check that every
 /// relay recomputes fresh in [toBytes] after mutating ttl/hopCount via
 /// [forwarded].

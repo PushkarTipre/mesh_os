@@ -77,6 +77,50 @@ class InboundMessage {
   final bool isFileChunk;
 }
 
+/// A point-in-time snapshot of this node's mesh activity (Checkpoint 9) --
+/// powers `mesh_console`'s debug/analytics view, but meaningful for any
+/// host app that wants visibility into what its node is doing on the
+/// mesh. Counters are cumulative since [MeshLink.start]; there's no
+/// reset, matching how [PacketDedupCache]/the relay store aren't reset
+/// either.
+class MeshLinkStats {
+  const MeshLinkStats({
+    required this.packetsSent,
+    required this.packetsReceived,
+    required this.packetsRelayed,
+    required this.bytesSent,
+    required this.bytesReceived,
+    required this.activeSessions,
+    required this.storedRelayPackets,
+  });
+
+  /// Logical [MeshPacket]s handed to the transport -- one per call to
+  /// the internal send path, regardless of whether it was fragmented
+  /// into several transport-level sends ([Fragmenter]) under the hood.
+  /// Includes retries: each retry attempt is a genuine new send.
+  final int packetsSent;
+
+  /// Successfully decoded incoming [MeshPacket]s, of any type --
+  /// includes acks, discovery, duplicates, and traffic just passing
+  /// through on its way to someone else.
+  final int packetsReceived;
+
+  /// Packets forwarded on behalf of another node (routed data/ack
+  /// traffic, or broadcast/publish flooding) -- see ARCHITECTURE.md §7.
+  final int packetsRelayed;
+
+  final int bytesSent;
+  final int bytesReceived;
+
+  /// Peers with a currently-live, handshake-completed session -- same
+  /// count as `MeshLink.sessions.length`.
+  final int activeSessions;
+
+  /// Packets currently held in the local store-and-forward cache,
+  /// waiting for a path to their destination (ARCHITECTURE.md §7).
+  final int storedRelayPackets;
+}
+
 /// Outcome of a [MeshLink.sendData]/[MeshLink.sendToNode] call.
 enum DeliveryStatus {
   /// The peer's [PacketType.ack] for this message was received --
@@ -197,6 +241,31 @@ class MeshLink {
   StreamSubscription<DataEvent>? _dataSub;
   Timer? _relayCleanupTimer;
 
+  // --- Stats (Checkpoint 9) -- see MeshLinkStats ---
+  int _packetsSent = 0;
+  int _packetsReceived = 0;
+  int _packetsRelayed = 0;
+  int _bytesSent = 0;
+  int _bytesReceived = 0;
+  final StreamController<MeshLinkStats> _statsController = StreamController.broadcast();
+
+  /// A snapshot of this node's mesh activity as of right now. See
+  /// [statsUpdates] to be notified as it changes rather than polling.
+  MeshLinkStats get stats => MeshLinkStats(
+        packetsSent: _packetsSent,
+        packetsReceived: _packetsReceived,
+        packetsRelayed: _packetsRelayed,
+        bytesSent: _bytesSent,
+        bytesReceived: _bytesReceived,
+        activeSessions: _sessions.length,
+        storedRelayPackets: _relayStore.length,
+      );
+
+  /// Emits a fresh [stats] snapshot every time any counter changes.
+  Stream<MeshLinkStats> get statsUpdates => _statsController.stream;
+
+  void _emitStats() => _statsController.add(stats);
+
   Stream<InboundMessage> get messages => _messages.stream;
 
   /// Emits a peer's remoteId the moment its discovery handshake completes
@@ -237,6 +306,7 @@ class MeshLink {
         _reassemblers.remove(event.remoteId);
         _relayRateLimitLog.remove(event.remoteId);
         _failPendingSendsFor(event.remoteId);
+        _emitStats(); // activeSessions changed, possibly with no packet event to piggyback on
       case ConnectionEventType.incomingRequest:
         break;
     }
@@ -262,6 +332,10 @@ class MeshLink {
   /// 1-byte envelope marker precedes every send so the receiving side
   /// knows whether to decode directly or feed it through a [Reassembler].
   Future<void> _sendBytes(String remoteId, Uint8List packetBytes) async {
+    _packetsSent++;
+    _bytesSent += packetBytes.length;
+    _emitStats();
+
     if (packetBytes.length + 1 <= transport.maxPayloadSize) {
       final envelope = BytesBuilder()
         ..addByte(_wholePacketMarker)
@@ -309,6 +383,9 @@ class MeshLink {
     } on PacketDecodeException {
       return; // malformed input -- drop, don't crash the link
     }
+    _packetsReceived++;
+    _bytesReceived += packetBytes.length;
+    _emitStats();
 
     if (packet.type == PacketType.discovery) {
       await _handleDiscovery(event.remoteId, packet);
@@ -352,6 +429,7 @@ class MeshLink {
     // covers new/reconnecting sessions).
     if (await trustStore.trustLevelFor(session.nodeId) == TrustLevel.blocked) {
       _sessions.remove(event.remoteId);
+      _emitStats();
       await transport.disconnect(event.remoteId);
       return;
     }
@@ -413,6 +491,7 @@ class MeshLink {
       agreementPublicKey: agreementPublicKey,
     );
     _sessionEstablished.add(remoteId);
+    _emitStats();
 
     // A fresh connection is a fresh opportunity to get stuck packets
     // moving again (ARCHITECTURE.md §7's "Charlie appears -> forward").
@@ -569,6 +648,8 @@ class MeshLink {
     if (forwarded == null) return; // ttl exhausted
     if (!await _relayAllowed(fromRemoteId)) return;
     if (!_recordRelayForRateLimit(fromRemoteId)) return;
+    _packetsRelayed++;
+    _emitStats();
     await _floodOrStore(forwarded, excludeRemoteId: fromRemoteId);
   }
 
@@ -680,6 +761,8 @@ class MeshLink {
     if (!await _relayAllowed(fromRemoteId)) return;
     if (!_recordRelayForRateLimit(fromRemoteId)) return;
 
+    _packetsRelayed++;
+    _emitStats();
     await _floodOrStore(forwarded, excludeRemoteId: fromRemoteId);
   }
 
@@ -821,6 +904,7 @@ class MeshLink {
     }
     if (await trustStore.trustLevelFor(session.nodeId) == TrustLevel.blocked) {
       _sessions.remove(remoteId);
+      _emitStats();
       throw StateError('MeshLink: $remoteId (${session.nodeId}) is blocked');
     }
     final envelope = await identity.encryptFor(plaintext, session.agreementPublicKey);
@@ -905,5 +989,6 @@ class MeshLink {
     _relayStore.clear();
     await _messages.close();
     await _sessionEstablished.close();
+    await _statsController.close();
   }
 }

@@ -113,6 +113,27 @@ class MeshOS {
     return transfers.incomingFiles;
   }
 
+  /// A snapshot of this node's mesh activity as of right now (packets
+  /// sent/received/relayed, bytes moved, active sessions, and packets
+  /// currently held in the local store-and-forward cache) -- powers
+  /// `mesh_console`'s debug/analytics view (Checkpoint 9). See
+  /// [statsUpdates] to be notified as it changes rather than polling.
+  MeshLinkStats get stats {
+    final link = _link;
+    if (link == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    return link.stats;
+  }
+
+  Stream<MeshLinkStats> get statsUpdates {
+    final link = _link;
+    if (link == null) {
+      throw StateError('MeshOS: call start() first');
+    }
+    return link.statsUpdates;
+  }
+
   /// Every contact this device has ever interacted with, regardless of
   /// whether they're currently nearby (ARCHITECTURE.md §4, §9).
   Future<List<Contact>> get contacts => _trustStore.listContacts();

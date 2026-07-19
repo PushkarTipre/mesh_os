@@ -184,6 +184,10 @@ Topic pub/sub (`publish`/`subscribe`) reuses the identical wire mechanism -- a `
 
 **`mesh_transport_ble`** (`packages/mesh_transport_ble/`) is the BLE adapter itself, built on the `bluetooth_low_energy` plugin -- every MeshOS node runs both BLE roles at once (a peripheral/GATT-server for incoming connections, a central/GATT-client for outbound ones), same "every node is an equal peer" principle as `NearbyTransport`. One GATT service, two characteristics: centrals write to send data to a peripheral, peripherals notify to send data to a subscribed central. `maxPayloadSize` is fixed at BLE's un-negotiated default ATT MTU floor (20 bytes) rather than the actual per-connection negotiated value (which `Transport`'s single-property interface can't carry) -- correctness never depends on negotiation succeeding, though `requestMTU` is still attempted opportunistically for better real throughput. Like `NearbyTransport`, this is a thin platform adapter, untestable without real Android hardware (BLE peripheral/GATT-server mode has no emulator support); everything it delegates to is already covered by `mesh_core`'s test suite against fake transports, including `MultiTransport` itself (`packages/mesh_core/test/transport/multi_transport_test.dart`).
 
+### Mesh activity stats
+
+**Implemented as of Checkpoint 9** (`MeshLinkStats`, `packages/mesh_core/lib/src/session/mesh_link.dart`, exposed on the facade as `MeshOS.stats`/`statsUpdates`). A cumulative, in-memory-only snapshot -- packets sent/received/relayed, bytes moved, active session count, and packets currently held in the local store-and-forward cache -- updated at the same choke points every packet already passes through (`_sendBytes`, the post-decode point in `_onDataEvent`, and both relay call sites), so it costs nothing extra to keep correct. Powers `mesh_console`'s debug view (a plain list-and-numbers screen, not a topology graph -- see ROADMAP.md's own "keep `mesh_console` ugly" guidance), but is generally useful to any host app that wants visibility into what its node is doing on the mesh.
+
 ---
 
 ## 8. Security model
@@ -193,7 +197,9 @@ Topic pub/sub (`publish`/`subscribe`) reuses the identical wire mechanism -- a `
 - Relays see only: routing header + encrypted bytes.
 - Private keys never leave the device.
 
-**Known limitations to document honestly (not solved in v1):** traffic-analysis resistance is partial (packet sizes/timing are observable), flooding is DoS-able by a hostile node (mitigation: per-peer rate limits), and temporary-ID rotation only *reduces* tracking. These are acceptable v1 trade-offs; record them in a `SECURITY.md` threat model as the design matures.
+**Known limitations to document honestly (not solved in v1):** traffic-analysis resistance is partial (packet sizes/timing are observable), flooding is DoS-able by a hostile node (mitigation: per-peer rate limits), and temporary-ID rotation only *reduces* tracking. These are acceptable v1 trade-offs.
+
+**As of Checkpoint 9**, the full threat model these bullets summarize -- what's protected, what explicitly isn't, and which threat actors MeshOS is and isn't designed to resist -- is written up properly in [SECURITY.md](SECURITY.md), not just scattered across this file's per-checkpoint notes.
 
 ---
 
@@ -233,9 +239,12 @@ await mesh.block(nodeId);
 await mesh.unblock(nodeId);
 await mesh.createIdentityCard(displayName: 'Pushkar');   // QR/NFC/share-code payload
 await mesh.trustFromIdentityCard(scannedPayload);        // verifies + trusts in one step
+
+mesh.stats;                     // snapshot: packets/bytes sent/received/relayed, sessions, ...
+mesh.statsUpdates.listen((stats) => ...);
 ```
 
-`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). As of Checkpoint 6, `send` transparently routes through relays (`MeshLink.sendToNode`, §7) when the destination isn't a direct neighbor -- callers never chose "direct" vs "routed" and don't need to. As of Checkpoint 7, `broadcast`/`publish`/`subscribe`/`unsubscribe`/`sendFile`/`outgoingFileProgress`/`incomingFiles` are implemented, thin wrappers over `mesh_core`'s `MeshLink` broadcast/pub-sub methods and `FileTransferManager` (§7). `messages` now filters out file-transfer chunks (`InboundMessage.isFileChunk`) before surfacing to the app -- use `incomingFiles` for those instead. As of Checkpoint 8, the `Transport` `start()` constructs is `MultiTransport([NearbyTransport(), BleTransport()])` (§7) instead of `NearbyTransport` alone -- transparent to every method above, none of their signatures or behavior changed.
+`initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). As of Checkpoint 6, `send` transparently routes through relays (`MeshLink.sendToNode`, §7) when the destination isn't a direct neighbor -- callers never chose "direct" vs "routed" and don't need to. As of Checkpoint 7, `broadcast`/`publish`/`subscribe`/`unsubscribe`/`sendFile`/`outgoingFileProgress`/`incomingFiles` are implemented, thin wrappers over `mesh_core`'s `MeshLink` broadcast/pub-sub methods and `FileTransferManager` (§7). `messages` now filters out file-transfer chunks (`InboundMessage.isFileChunk`) before surfacing to the app -- use `incomingFiles` for those instead. As of Checkpoint 8, the `Transport` `start()` constructs is `MultiTransport([NearbyTransport(), BleTransport()])` (§7) instead of `NearbyTransport` alone -- transparent to every method above, none of their signatures or behavior changed. As of Checkpoint 9, `stats`/`statsUpdates` are implemented, a thin wrapper over `mesh_core`'s `MeshLink.stats`/`statsUpdates` (§7).
 
 ---
 

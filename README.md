@@ -15,9 +15,42 @@ await mesh.send(destination: nodeId, payload: bytes);
 mesh.messages.listen((msg) => ...);
 ```
 
+## Quick start
+
+Send an offline message between two Android phones, starting from nothing:
+
+1. Clone this repo, then from its root: `flutter pub get`.
+2. In `apps/mesh_console` (the dev/demo app -- see "Try it" below for what it's for), run `flutter run` on two Android phones over USB (or one at a time if you only have one cable). Grant every permission prompt on both.
+3. Within a few seconds, each phone lists the other under "Nearby devices," moving through "Connecting..." → "Handshaking..." → "Ready to chat." Tap either phone's entry for the other to open a chat screen and send a message -- no manual pairing, no account, no internet on either device (try airplane mode if you want to prove it).
+
+That's the whole loop. `mesh_console` is a thin instrument panel over the SDK -- if you're building your own app instead of poking at the demo, here's the entire API surface that loop uses:
+
+```dart
+import 'package:mesh_os/mesh_os.dart';
+
+final mesh = MeshOS();
+await mesh.initialize();      // loads/creates this device's identity
+await mesh.start();           // starts advertising + discovery + auto-connect
+
+mesh.deviceUpdates.listen((devices) => ...);   // reactive list of nearby peers
+mesh.messages.listen((msg) => ...);            // incoming messages, decrypted and verified
+
+await mesh.send(destination: someNodeId, payload: utf8.encode('hello'));
+```
+
+`mesh_os` isn't published to pub.dev yet (see "Release status" below), so pull it in as a path or git dependency for now:
+
+```yaml
+dependencies:
+  mesh_os:
+    path: ../mesh_os/packages/mesh_os   # or: git: {url: ..., path: packages/mesh_os}
+```
+
+See [ARCHITECTURE.md §10](ARCHITECTURE.md) for the full public API (trust/contacts, QR identity exchange, broadcast/pub-sub, file transfer, mesh stats) and [ARCHITECTURE.md §11](ARCHITECTURE.md) for the Android permissions your own app's manifest will need (the ones `apps/mesh_console/android/app/src/main/AndroidManifest.xml` already declares -- copy that file's Bluetooth/location/camera block as a starting point).
+
 ## Status
 
-🚧 Early development — **Checkpoints 0–8 done in code** (project scaffolding; identity & crypto core; packet layer; Nearby Connections transport; the public `MeshOS` facade with reliable single-hop messaging; trust/contacts/QR exchange with SQLite persistence; multi-hop routing with flooding, store-and-forward, and end-to-end ack; broadcast + topic pub/sub + resumable file transfer; a second transport (BLE) with automatic selection between it and Nearby). None of CP3–CP8's on-device demos — real phones actually discovering, chatting, exchanging QR codes, relaying for each other, broadcasting, transferring files, and falling back to BLE — have been run yet; see "Try it" below. **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
+🚧 Early development — **Checkpoints 0–9 done in code** (project scaffolding; identity & crypto core; packet layer; Nearby Connections transport; the public `MeshOS` facade with reliable single-hop messaging; trust/contacts/QR exchange with SQLite persistence; multi-hop routing with flooding, store-and-forward, and end-to-end ack; broadcast + topic pub/sub + resumable file transfer; a second transport (BLE) with automatic selection between it and Nearby; mesh activity stats, a debug view, and this documentation pass). None of CP3–CP9's on-device demos — real phones actually discovering, chatting, exchanging QR codes, relaying for each other, broadcasting, transferring files, and falling back to BLE — have been run yet; see "Try it" below. **Android-only for v1**; iOS is deferred (see the platform reality check in ARCHITECTURE.md §11). See [ROADMAP.md](ROADMAP.md) for the checkpoint plan and what "done" means at each stage.
 
 ## Repo layout
 
@@ -37,7 +70,7 @@ Everything that runs without hardware:
 
 ```
 flutter pub get                          # from repo root
-(cd packages/mesh_core && dart test)     # 116 unit tests: identity/crypto/packets/session/delivery/trust/routing/broadcast/pub-sub/file-transfer/multi-transport (CP1-CP8)
+(cd packages/mesh_core && dart test)     # 121 unit tests: identity/crypto/packets/session/delivery/trust/routing/broadcast/pub-sub/file-transfer/multi-transport/stats (CP1-CP9)
 (cd packages/mesh_os && flutter test)    # 7 unit tests: DriftTrustStore against real in-memory SQLite
 flutter analyze                          # whole workspace
 (cd packages/mesh_core && dart run example/identity_demo.dart)  # see the crypto core in action
@@ -76,7 +109,18 @@ The CP8 demo, two phones, needs Android's Bluetooth (and, on one phone, a way to
 
 `apps/mesh_console` no longer touches `mesh_transport_nearby` directly (that was a CP3-only shortcut) -- it only calls `MeshOS`, same as any other app built on the SDK would. Checkpoint 8's transport swap (`MultiTransport([NearbyTransport(), BleTransport()])` instead of `NearbyTransport()` alone) happens entirely inside `MeshOS.start()` -- `mesh_console` needed zero changes for it.
 
+The CP9 demo needs no new setup -- tap the hub icon in the app bar (next to the broadcast megaphone) to open the debug view, and watch its counters move live while you use the app normally: send a chat message and watch `packetsSent`/`packetsReceived` climb on both phones; do the CP6 three-phone relay demo and watch `packetsRelayed` climb on the middle phone only, never the two endpoints.
+
 ## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design: identity, trust model, packet format, routing, security model, platform constraints.
+- [SECURITY.md](SECURITY.md) — threat model: what's protected, what isn't, and why, stated plainly.
 - [ROADMAP.md](ROADMAP.md) — checkpoints CP0–CP9 with exit-criterion demos, hardware needs, and standing risks.
+
+## Using `mesh_console` as a starting template
+
+`apps/mesh_console` is a real, if deliberately plain, example of a MeshOS app -- broadcast, QR trust exchange, file transfer, and the debug view all work end-to-end (once verified on real hardware) through nothing but the public `MeshOS` facade. To start your own app from it: copy the `apps/mesh_console` directory, rename the package in its `pubspec.yaml`, and delete whichever demo screens you don't need (`broadcast_screen.dart`, `mesh_debug_screen.dart`, `identity_card_screens.dart` are all independently removable -- `main.dart` and `chat_history.dart` are the minimal core). It intentionally has no product design or branding of its own to strip out.
+
+## Release status
+
+Not yet published anywhere -- `mesh_os` and its sibling packages are pre-1.0 (`0.1.0`, semantic versioning: expect breaking API changes between minor versions until 1.0), only consumable as a path or git dependency (see "Quick start" above), and this repo has no `LICENSE` file yet. None of that is an oversight so much as sequencing: CP9 is "polish the code and docs so it's ready," not "flip the switch" -- actually publishing to pub.dev and choosing an open-source license are decisions for whoever owns this repo to make deliberately, not something to happen as a side effect of a documentation pass.

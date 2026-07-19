@@ -147,13 +147,21 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 ---
 
-## Checkpoint 9 — SDK polish & release (= PDF Phase 6)
+## Checkpoint 9 — SDK polish & release (= PDF Phase 6) ✅ code + docs done, release steps intentionally not taken
 
-- [ ] Network topology debug view + mesh analytics in `mesh_console`.
-- [ ] API docs, README quick-start, `SECURITY.md` threat model (honest about limits: traffic analysis, flooding DoS, tracking reduction).
-- [ ] Example app extracted as a template; semantic versioning; publish `mesh_os` to pub.dev / open-source release.
+**Goal:** make the SDK legible and usable by someone who isn't the person who wrote it -- and be honest about which parts of "release" are actually this checkpoint's to do.
 
-**Exit criterion:** a developer who has never seen the codebase follows the README and sends an offline message between two devices in under 30 minutes.
+- [x] Network topology debug view + mesh analytics in `mesh_console`. (`MeshDebugScreen`, hub icon in the app bar) Deliberately plain -- lists and live-updating numbers, not a graph renderer, per this file's own "keep `mesh_console` ugly" guidance below. Backed by a new `MeshLinkStats` (`packages/mesh_core/lib/src/session/mesh_link.dart`): packets/bytes sent/received/relayed, active sessions, store-and-forward queue depth, updated at the same choke points every packet already passes through. Exposed on the facade as `MeshOS.stats`/`statsUpdates`.
+- [x] API docs: `dart doc` runs clean (0 warnings, 0 errors) across `mesh_core` and `mesh_os` -- fixed 6 broken `[symbol]` cross-references found by actually running it, not just assumed correct.
+- [x] README quick-start: a new top-of-file section gets a from-scratch reader to a working two-phone message exchange, matching this checkpoint's exit criterion, distinct from the existing per-checkpoint "Try it" walkthroughs.
+- [x] `SECURITY.md` threat model: what's protected, what explicitly isn't (traffic analysis, flooding DoS beyond rate limiting, temp-ID rotation limits, no forward secrecy, no relay accountability), and which threat actors MeshOS is/isn't designed to resist -- consolidates and expands on notes that were previously scattered across ARCHITECTURE.md's per-checkpoint sections.
+- [x] `mesh_console` documented as a starting template (README section: what to copy, what to delete) -- true today because it was already built against the public `MeshOS` facade only, nothing SDK-internal to strip out.
+- [x] Semantic versioning: every package already used it correctly (`0.1.0`, pre-1.0 = expect breaking changes); added `CHANGELOG.md` to each publishable package to make that practice concrete going forward.
+- [ ] **Publishing `mesh_os` to pub.dev and any "open-source release" (public repo, LICENSE choice) were deliberately not done.** Both are real, externally-visible, hard-to-reverse decisions for whoever owns this repo to make on purpose -- a license choice has legal weight, and a pub.dev publish is permanent even if later unlisted. Neither happens as a side effect of a documentation pass. See README.md's "Release status" for what's ready whenever that decision gets made.
+
+**Test coverage (no hardware needed):** 5 new tests in `packages/mesh_core` (121 total) in `test/session/mesh_link_stats_test.dart` -- session count tracking, packet/byte counters incrementing on send and receive, live `statsUpdates` stream, `packetsRelayed` incrementing only on the middle node of a 3-hop relay (never the endpoints), and `storedRelayPackets` reflecting the store-and-forward queue depth as a packet waits and then gets delivered.
+
+**Exit criterion:** a developer who has never seen the codebase follows the README and sends an offline message between two devices in under 30 minutes. **Not yet verified against an actual outside developer** -- the Quick Start section is written to satisfy it, but by definition this needs someone who hasn't already been working in this codebase to try it and report back.
 
 ---
 
