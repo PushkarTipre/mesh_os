@@ -10,6 +10,7 @@ import 'broadcast_screen.dart';
 import 'chat_history.dart';
 import 'identity_card_screens.dart';
 import 'mesh_debug_screen.dart';
+import 'mesh_simulator_screen.dart';
 
 void main() {
   runApp(const MeshConsoleApp());
@@ -120,6 +121,12 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<void> _showSimulator() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const MeshSimulatorScreen()),
+    );
+  }
+
   Future<void> _setTrustLevel(String nodeId, TrustLevel level) async {
     switch (level) {
       case TrustLevel.trusted:
@@ -139,6 +146,7 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('MeshOS Console'),
         actions: [
+          IconButton(icon: const Icon(Icons.science), onPressed: _showSimulator),
           IconButton(icon: const Icon(Icons.hub), onPressed: _showDebug),
           IconButton(icon: const Icon(Icons.campaign), onPressed: _showBroadcast),
           IconButton(icon: const Icon(Icons.qr_code), onPressed: _showMyCode),

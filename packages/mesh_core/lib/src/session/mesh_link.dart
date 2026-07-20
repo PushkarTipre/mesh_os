@@ -970,11 +970,21 @@ class MeshLink {
   }
 
   Future<void> dispose() async {
-    await _connectionSub?.cancel();
-    await _dataSub?.cancel();
+    // Cancel every Timer synchronously, before any await -- a caller that
+    // fires-and-forgets dispose() (can't await it from a synchronous
+    // context like State.dispose()) still needs these gone the instant
+    // dispose() is *called*, not whenever this async body next gets
+    // scheduled. Dart runs an async function's body synchronously up to
+    // its first await, so this ordering is what makes that guarantee
+    // actually hold.
     _relayCleanupTimer?.cancel();
     for (final pending in _pendingSends.values) {
       pending.timer?.cancel();
+    }
+
+    await _connectionSub?.cancel();
+    await _dataSub?.cancel();
+    for (final pending in _pendingSends.values) {
       if (!pending.completer.isCompleted) {
         pending.completer.complete(DeliveryStatus.failed);
       }

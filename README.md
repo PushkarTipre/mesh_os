@@ -38,7 +38,7 @@ mesh.messages.listen((msg) => ...);            // incoming messages, decrypted a
 await mesh.send(destination: someNodeId, payload: utf8.encode('hello'));
 ```
 
-`mesh_os` isn't published to pub.dev yet (see "Release status" below), so pull it in as a path or git dependency for now:
+`mesh_os` is not on pub.dev, by design (see "Release status" below) -- pull it in as a path dependency:
 
 ```yaml
 dependencies:
@@ -72,9 +72,12 @@ Everything that runs without hardware:
 flutter pub get                          # from repo root
 (cd packages/mesh_core && dart test)     # 121 unit tests: identity/crypto/packets/session/delivery/trust/routing/broadcast/pub-sub/file-transfer/multi-transport/stats (CP1-CP9)
 (cd packages/mesh_os && flutter test)    # 7 unit tests: DriftTrustStore against real in-memory SQLite
+(cd apps/mesh_console && flutter test)   # 6 widget tests: the Mesh Simulator screen, below
 flutter analyze                          # whole workspace
 (cd packages/mesh_core && dart run example/identity_demo.dart)  # see the crypto core in action
 ```
+
+**Don't have a second phone yet?** Run `apps/mesh_console` on one device (a real phone or an Android emulator -- this doesn't need real Bluetooth/Nearby at all) and tap the beaker icon in the app bar. That opens the **Mesh Simulator**: a real 3-node mesh (Alice, Bob, Charlie) running in-process on just this one device, using the actual `MeshLink`/`FileTransferManager` code, over an in-memory fake radio instead of Nearby/BLE. Buttons let you send a multi-hop message, broadcast, transfer a file, and take the middle node offline mid-transfer to watch store-and-forward kick in. This proves the entire protocol stack works correctly compiled into a real running app -- **it does not and cannot prove `NearbyTransport`/`BleTransport` themselves work**, since that specifically requires two distinct physical radios talking to each other over the air; the screen says so directly. See [NEXT_STEPS.md](NEXT_STEPS.md) for what still needs real hardware.
 
 The CP3–CP5 demo, two Android phones (Nearby Connections has no emulator support and QR scanning needs real cameras):
 
@@ -116,6 +119,7 @@ The CP9 demo needs no new setup -- tap the hub icon in the app bar (next to the 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design: identity, trust model, packet format, routing, security model, platform constraints.
 - [SECURITY.md](SECURITY.md) — threat model: what's protected, what isn't, and why, stated plainly.
 - [ROADMAP.md](ROADMAP.md) — checkpoints CP0–CP9 with exit-criterion demos, hardware needs, and standing risks.
+- [NEXT_STEPS.md](NEXT_STEPS.md) — what's actually left: hardware verification, post-1.0 features, and what's deliberately not planned.
 
 ## Using `mesh_console` as a starting template
 
@@ -123,4 +127,4 @@ The CP9 demo needs no new setup -- tap the hub icon in the app bar (next to the 
 
 ## Release status
 
-Not yet published anywhere -- `mesh_os` and its sibling packages are pre-1.0 (`0.1.0`, semantic versioning: expect breaking API changes between minor versions until 1.0), only consumable as a path or git dependency (see "Quick start" above), and this repo has no `LICENSE` file yet. None of that is an oversight so much as sequencing: CP9 is "polish the code and docs so it's ready," not "flip the switch" -- actually publishing to pub.dev and choosing an open-source license are decisions for whoever owns this repo to make deliberately, not something to happen as a side effect of a documentation pass.
+**Staying private, by decision, not by default.** `mesh_os` and its sibling packages are pre-1.0 (`0.1.0`, semantic versioning: expect breaking API changes between minor versions until 1.0) and are consumed as path dependencies within this workspace (see "Quick start" above). This project will not be published to pub.dev or made an open-source release -- pub.dev exists to let people outside this repo add the package with one line instead of pointing at the source directly; since there's no intended external consumer, it adds nothing here. A `git:` dependency would work identically to a path dependency if this ever splits across repos, still with no pub.dev involved. See [NEXT_STEPS.md](NEXT_STEPS.md) for what's actually still outstanding.

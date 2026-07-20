@@ -147,7 +147,7 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 
 ---
 
-## Checkpoint 9 — SDK polish & release (= PDF Phase 6) ✅ code + docs done, release steps intentionally not taken
+## Checkpoint 9 — SDK polish & release (= PDF Phase 6) ✅ done -- staying a private project by decision
 
 **Goal:** make the SDK legible and usable by someone who isn't the person who wrote it -- and be honest about which parts of "release" are actually this checkpoint's to do.
 
@@ -157,7 +157,7 @@ Android-only scope means transport v1 is **Google Nearby Connections**, not BLE 
 - [x] `SECURITY.md` threat model: what's protected, what explicitly isn't (traffic analysis, flooding DoS beyond rate limiting, temp-ID rotation limits, no forward secrecy, no relay accountability), and which threat actors MeshOS is/isn't designed to resist -- consolidates and expands on notes that were previously scattered across ARCHITECTURE.md's per-checkpoint sections.
 - [x] `mesh_console` documented as a starting template (README section: what to copy, what to delete) -- true today because it was already built against the public `MeshOS` facade only, nothing SDK-internal to strip out.
 - [x] Semantic versioning: every package already used it correctly (`0.1.0`, pre-1.0 = expect breaking changes); added `CHANGELOG.md` to each publishable package to make that practice concrete going forward.
-- [ ] **Publishing `mesh_os` to pub.dev and any "open-source release" (public repo, LICENSE choice) were deliberately not done.** Both are real, externally-visible, hard-to-reverse decisions for whoever owns this repo to make on purpose -- a license choice has legal weight, and a pub.dev publish is permanent even if later unlisted. Neither happens as a side effect of a documentation pass. See README.md's "Release status" for what's ready whenever that decision gets made.
+- [x] **Decided: this stays a private project.** No pub.dev publish, no public repo, no LICENSE needed for that purpose. Pub.dev exists to let people outside this repo add the package with one line instead of pointing at the source directly -- with no intended external consumer, it has nothing to offer here; a path (or, if this ever splits across repos, `git:`) dependency does everything pub.dev would, without publishing anything. See [NEXT_STEPS.md](NEXT_STEPS.md) and README.md's "Release status."
 
 **Test coverage (no hardware needed):** 5 new tests in `packages/mesh_core` (121 total) in `test/session/mesh_link_stats_test.dart` -- session count tracking, packet/byte counters incrementing on send and receive, live `statsUpdates` stream, `packetsRelayed` incrementing only on the middle node of a 3-hop relay (never the endpoints), and `storedRelayPackets` reflecting the store-and-forward queue depth as a packet waits and then gets delivered.
 
