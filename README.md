@@ -77,7 +77,7 @@ flutter analyze                          # whole workspace
 (cd packages/mesh_core && dart run example/identity_demo.dart)  # see the crypto core in action
 ```
 
-**Don't have a second phone yet?** Run `apps/mesh_console` on one device (a real phone or an Android emulator -- this doesn't need real Bluetooth/Nearby at all) and tap the beaker icon in the app bar. That opens the **Mesh Simulator**: a real 3-node mesh (Alice, Bob, Charlie) running in-process on just this one device, using the actual `MeshLink`/`FileTransferManager` code, over an in-memory fake radio instead of Nearby/BLE. Buttons let you send a multi-hop message, broadcast, transfer a file, and take the middle node offline mid-transfer to watch store-and-forward kick in. This proves the entire protocol stack works correctly compiled into a real running app -- **it does not and cannot prove `NearbyTransport`/`BleTransport` themselves work**, since that specifically requires two distinct physical radios talking to each other over the air; the screen says so directly. See [NEXT_STEPS.md](NEXT_STEPS.md) for what still needs real hardware.
+**Don't have a second phone yet?** Run `apps/mesh_console` on one device (a real phone or an Android emulator -- this doesn't need real Bluetooth/Nearby at all), open the hamburger menu, and tap **Mesh Simulator**. That opens a real 3-node mesh (Alice, Bob, Charlie) running in-process on just this one device, using the actual `MeshLink`/`FileTransferManager` code, over an in-memory fake radio instead of Nearby/BLE. Buttons let you send a multi-hop message, broadcast, transfer a file, and take the middle node offline mid-transfer to watch store-and-forward kick in. This proves the entire protocol stack works correctly compiled into a real running app -- **it does not and cannot prove `NearbyTransport`/`BleTransport` themselves work**, since that specifically requires two distinct physical radios talking to each other over the air; the screen says so directly. See [NEXT_STEPS.md](NEXT_STEPS.md) for what still needs real hardware.
 
 The CP3–CP5 demo, two Android phones (Nearby Connections has no emulator support and QR scanning needs real cameras):
 
@@ -86,7 +86,7 @@ The CP3–CP5 demo, two Android phones (Nearby Connections has no emulator suppo
 3. Each phone shows its Node ID and starts advertising + discovering + auto-connecting automatically -- no manual pairing.
 4. Within a few seconds each phone lists the other, first as "Connecting...", then "Handshaking...", then "Ready to chat · known" — note: no name yet, just the Node ID.
 5. Tap the peer on either phone to open a chat screen; send a message. It should appear on the other phone almost immediately, and the sender's copy should flip from "sending" to "delivered".
-6. On phone A, tap the QR icon in the app bar, type a display name, and show the generated code. On phone B, tap the scan icon and scan it. B should get a "Trusted <name>" confirmation, and B's device-list entry for A should now show that name instead of A's Node ID. Repeat in the other direction so both sides are trusted.
+6. On phone A, open the hamburger menu and tap **My QR Code**, type a display name, and show the generated code. On phone B, open the hamburger menu and tap **Scan QR Code**. B should get a "Trusted <name>" confirmation, and B's device-list entry for A should now show that name instead of A's Node ID. Repeat in the other direction so both sides are trusted.
 7. Long-press (via the trailing menu) either device and choose **Block**. The connection should drop within moments, and the two phones should not reconnect while the block is in place. **Unblock** should let them find each other again.
 8. Force-quit and reopen the app on either phone — the Node ID, the chat history, and the trusted contact's name should all still be there.
 
@@ -100,7 +100,7 @@ The CP6 demo, which needs a **third** phone (this is the first checkpoint where 
 
 The CP7 demo, back to two phones (broadcast) plus the same third-phone setup above if you want to confirm a broadcast crosses a relay too:
 
-1. On both phones, tap the megaphone icon in the app bar to open the Broadcast screen. Type a message on phone A and send it -- it should appear on phone B's Broadcast screen within moments, with A's Node ID as sender, even if A and B have never exchanged QR codes or chatted before (broadcast needs no prior contact).
+1. On both phones, open the hamburger menu and tap **Broadcast**. Type a message on phone A and send it -- it should appear on phone B's Broadcast screen within moments, with A's Node ID as sender, even if A and B have never exchanged QR codes or chatted before (broadcast needs no prior contact).
 2. Open a chat with a trusted/known peer and tap the paperclip icon -- pick a photo from the gallery. It should appear as an outgoing bubble on the sender's screen with a live progress bar, and arrive on the peer's screen as an inline image once complete.
 3. Mid-transfer (pick a larger photo, or a slower/farther connection, to give yourself a window), walk the two phones out of range of each other. The sender's bubble should show "paused" partway through. Walk back into range -- the transfer should resume from where it left off (not restart) and finish, with the full image arriving correctly on the receiving phone.
 
@@ -112,7 +112,7 @@ The CP8 demo, two phones, needs Android's Bluetooth (and, on one phone, a way to
 
 `apps/mesh_console` no longer touches `mesh_transport_nearby` directly (that was a CP3-only shortcut) -- it only calls `MeshOS`, same as any other app built on the SDK would. Checkpoint 8's transport swap (`MultiTransport([NearbyTransport(), BleTransport()])` instead of `NearbyTransport()` alone) happens entirely inside `MeshOS.start()` -- `mesh_console` needed zero changes for it.
 
-The CP9 demo needs no new setup -- tap the hub icon in the app bar (next to the broadcast megaphone) to open the debug view, and watch its counters move live while you use the app normally: send a chat message and watch `packetsSent`/`packetsReceived` climb on both phones; do the CP6 three-phone relay demo and watch `packetsRelayed` climb on the middle phone only, never the two endpoints.
+The CP9 demo needs no new setup -- open the hamburger menu and tap **Mesh Debug** to open the debug view, and watch its counters move live while you use the app normally: send a chat message and watch `packetsSent`/`packetsReceived` climb on both phones; do the CP6 three-phone relay demo and watch `packetsRelayed` climb on the middle phone only, never the two endpoints.
 
 ## Documentation
 

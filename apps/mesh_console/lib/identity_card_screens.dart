@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:mesh_os/mesh_os.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// "Becoming Contacts" (ARCHITECTURE.md §9): shows this device's identity
 /// card as a QR code, choosing a display name that's revealed only to
@@ -16,9 +19,28 @@ class MyIdentityCardScreen extends StatefulWidget {
 }
 
 class _MyIdentityCardScreenState extends State<MyIdentityCardScreen> {
+  static const _prefsKey = 'mesh_console.last_display_name';
+
   final TextEditingController _nameController = TextEditingController();
   String? _encodedCard;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadLastName();
+  }
+
+  Future<void> _loadLastName() async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastName = prefs.getString(_prefsKey);
+    if (lastName == null || !mounted) return;
+    _nameController.text = lastName;
+    // Same name as last time -- regenerate immediately so returning to
+    // this screen shows a code right away instead of an empty form
+    // requiring the exact same name to be typed in again.
+    unawaited(_generate());
+  }
 
   @override
   void dispose() {
@@ -31,11 +53,15 @@ class _MyIdentityCardScreenState extends State<MyIdentityCardScreen> {
     if (name.isEmpty) return;
     try {
       final card = await widget.mesh.createIdentityCard(displayName: name);
+      if (!mounted) return;
       setState(() {
         _encodedCard = card;
         _error = null;
       });
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefsKey, name);
     } catch (e) {
+      if (!mounted) return;
       setState(() => _error = '$e');
     }
   }

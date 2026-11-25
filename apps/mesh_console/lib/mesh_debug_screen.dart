@@ -26,16 +26,13 @@ class _MeshDebugScreenState extends State<MeshDebugScreen> {
   StreamSubscription<MeshLinkStats>? _statsSub;
   StreamSubscription<List<MeshDevice>>? _deviceSub;
   StreamSubscription<List<Contact>>? _contactSub;
+  Timer? _statsRetryTimer;
 
   @override
   void initState() {
     super.initState();
-    _stats = widget.mesh.stats;
+    _tryLoadStats();
     _devices = widget.mesh.devices;
-    _statsSub = widget.mesh.statsUpdates.listen((stats) {
-      if (!mounted) return;
-      setState(() => _stats = stats);
-    });
     _deviceSub = widget.mesh.deviceUpdates.listen((devices) {
       if (!mounted) return;
       setState(() => _devices = devices);
@@ -50,11 +47,36 @@ class _MeshDebugScreenState extends State<MeshDebugScreen> {
     });
   }
 
+  /// `MeshOS.stats`/`statsUpdates` throw until `MeshOS.start()` has
+  /// finished (it needs a live `MeshLink`, only created at the end of
+  /// `start()`) -- opening this screen while that's still in flight
+  /// (waiting on a permission dialog, for example) would otherwise crash
+  /// this whole screen instead of just showing "No activity yet". Retry
+  /// shortly instead; the existing `stats == null` branch in [build]
+  /// already renders sensibly in the meantime.
+  void _tryLoadStats() {
+    try {
+      _stats = widget.mesh.stats;
+      _statsSub = widget.mesh.statsUpdates.listen((stats) {
+        if (!mounted) return;
+        setState(() => _stats = stats);
+      });
+      _statsRetryTimer?.cancel();
+    } catch (_) {
+      _statsRetryTimer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        _tryLoadStats();
+        if (_stats != null) setState(() {});
+      });
+    }
+  }
+
   @override
   void dispose() {
     _statsSub?.cancel();
     _deviceSub?.cancel();
     _contactSub?.cancel();
+    _statsRetryTimer?.cancel();
     super.dispose();
   }
 

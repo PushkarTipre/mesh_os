@@ -6,14 +6,38 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:mesh_os/mesh_os.dart';
 
+import 'app_log.dart';
+import 'broadcast_log.dart';
 import 'broadcast_screen.dart';
 import 'chat_history.dart';
+import 'error_log_screen.dart';
 import 'identity_card_screens.dart';
 import 'mesh_debug_screen.dart';
 import 'mesh_simulator_screen.dart';
 
+/// Catches everything that could otherwise crash silently on a device
+/// nobody's watching a debugger on -- see AppLog's own doc comment for
+/// why this exists. `runZonedGuarded` is what makes even errors thrown
+/// *outside* any widget's build/callback (a bad Future anywhere in the
+/// app) reach [AppLog] rather than just terminating the isolate.
 void main() {
-  runApp(const MeshConsoleApp());
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    await AppLog.instance.init();
+    AppLog.instance.log('App starting');
+
+    FlutterError.onError = (details) {
+      AppLog.instance.log(
+        'Flutter error: ${details.exceptionAsString()}\n${details.stack}',
+        level: LogLevel.error,
+      );
+      FlutterError.presentError(details);
+    };
+
+    runApp(const MeshConsoleApp());
+  }, (error, stack) {
+    AppLog.instance.log('Uncaught error: $error\n$stack', level: LogLevel.error);
+  });
 }
 
 class MeshConsoleApp extends StatelessWidget {
@@ -43,27 +67,60 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final MeshOS _mesh = MeshOS();
   final ChatHistoryStore _historyStore = ChatHistoryStore();
+  final BroadcastLog _broadcastLog = BroadcastLog();
 
   bool _ready = false;
+  bool _slowStart = false;
   String? _error;
   List<MeshDevice> _devices = const [];
   List<Contact> _contacts = const [];
 
   StreamSubscription<List<MeshDevice>>? _deviceSub;
   StreamSubscription<List<Contact>>? _contactSub;
+  StreamSubscription<String>? _diagSub;
+  StreamSubscription<InboundMessage>? _messageSub;
+  Timer? _slowStartTimer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Subscribed before start() is even called, so every diagnostic --
+    // including the very first one -- ends up in the error log.
+    _diagSub = _mesh.diagnostics.listen(AppLog.instance.log);
     _bootstrap();
+  }
+
+  /// Android suspends/throttles both Nearby Connections and BLE
+  /// scanning/advertising while the app is backgrounded (most
+  /// aggressively once the screen is off), and neither radio
+  /// automatically resumes just because the app becomes visible again --
+  /// observed on real devices as two phones sitting right next to each
+  /// other, both freshly resumed, showing each other as "not nearby"
+  /// indefinitely. See [MeshOS.refreshDiscovery]'s doc comment and
+  /// NEXT_STEPS.md.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !_ready) return;
+    AppLog.instance.log('App resumed -- refreshing discovery');
+    unawaited(_mesh.refreshDiscovery());
   }
 
   Future<void> _bootstrap() async {
     try {
+      // Loaded before start() so both stores are ready the moment the
+      // mesh.messages listener below is subscribed -- no window where an
+      // early incoming message could arrive before there's anywhere to
+      // put it.
+      await Future.wait([_historyStore.init(), _broadcastLog.init()]);
+
+      AppLog.instance.log('Loading identity...');
       await _mesh.initialize();
+      AppLog.instance.log('Identity loaded: ${_mesh.identity.nodeId}');
+
       _deviceSub = _mesh.deviceUpdates.listen((devices) {
         if (!mounted) return;
         setState(() => _devices = devices);
@@ -72,23 +129,84 @@ class _HomeScreenState extends State<HomeScreen> {
         if (!mounted) return;
         setState(() => _contacts = contacts);
       });
+      // The one place incoming chat/broadcast messages are handled --
+      // deliberately not inside ChatScreen/BroadcastScreen, which are
+      // only alive while that exact screen is on top. HomeScreen stays
+      // subscribed for as long as the app is running in the foreground,
+      // regardless of what's currently showing, so a message no longer
+      // requires the recipient to have the right screen open to be
+      // received. See ChatHistoryStore's doc comment for the full story.
+      _messageSub = _mesh.messages.listen(_onMessage);
+
+      // Purely informational, not a failure: some devices legitimately
+      // take longer than this to clear permission dialogs and radio
+      // setup (BLE's own authorize() calls alone can take up to 20s to
+      // time out on a device that never grants them -- see
+      // NEXT_STEPS.md). start() below is still awaited to completion no
+      // matter how long it takes -- a previous version used
+      // `.timeout()`, which stopped *waiting* for start() once the
+      // deadline passed but didn't stop start() itself, so a start()
+      // that finished a few seconds after the deadline left the UI
+      // stuck on a permanent error screen despite having actually
+      // succeeded. This only changes what's on screen while waiting.
+      _slowStartTimer = Timer(const Duration(seconds: 20), () {
+        if (!mounted || _ready) return;
+        AppLog.instance.log('start() is taking longer than 20s -- still waiting', level: LogLevel.warning);
+        setState(() => _slowStart = true);
+      });
+
       await _mesh.start();
+      _slowStartTimer?.cancel();
+
       final contacts = await _mesh.contacts;
       if (!mounted) return;
       setState(() {
         _ready = true;
+        _slowStart = false;
+        _error = null;
         _contacts = contacts;
       });
-    } catch (e) {
+    } catch (e, stack) {
+      _slowStartTimer?.cancel();
+      AppLog.instance.log('Startup failed: $e\n$stack', level: LogLevel.error);
       if (!mounted) return;
       setState(() => _error = '$e');
     }
   }
 
+  /// [MeshOS.messages] carries both broadcast/publish traffic
+  /// (`topic != null`) and ordinary chat -- routed here to the matching
+  /// persistent store either way, so both survive regardless of which
+  /// screen -- if any -- happens to be open when they arrive.
+  void _onMessage(InboundMessage message) {
+    if (message.topic != null) {
+      _broadcastLog.add(BroadcastEntry(
+        senderNodeId: message.senderNodeId,
+        text: utf8.decode(message.plaintext),
+        timestamp: DateTime.now(),
+      ));
+      return;
+    }
+    unawaited(_historyStore.add(
+      message.senderNodeId,
+      ChatMessageRecord(
+        id: newChatMessageId(),
+        outgoing: false,
+        text: utf8.decode(message.plaintext),
+        timestamp: DateTime.now(),
+        status: 'received',
+      ),
+    ));
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _slowStartTimer?.cancel();
     _deviceSub?.cancel();
     _contactSub?.cancel();
+    _diagSub?.cancel();
+    _messageSub?.cancel();
     _mesh.dispose();
     super.dispose();
   }
@@ -111,7 +229,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _showBroadcast() async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => BroadcastScreen(mesh: _mesh)),
+      MaterialPageRoute<void>(builder: (_) => BroadcastScreen(mesh: _mesh, log: _broadcastLog)),
     );
   }
 
@@ -124,6 +242,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _showSimulator() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(builder: (_) => const MeshSimulatorScreen()),
+    );
+  }
+
+  Future<void> _showErrorLog() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const ErrorLogScreen()),
     );
   }
 
@@ -140,23 +264,109 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Closes the drawer, then runs [action] -- every drawer item uses
+  /// this so tapping one doesn't leave the drawer open behind the new
+  /// screen.
+  void _fromDrawer(Future<void> Function() action) {
+    Navigator.of(context).pop();
+    action();
+  }
+
+  Drawer _buildDrawer() {
+    return Drawer(
+      child: ListView(
+        padding: EdgeInsets.zero,
+        children: [
+          const DrawerHeader(
+            child: Align(
+              alignment: Alignment.bottomLeft,
+              child: Text('MeshOS Console', style: TextStyle(fontSize: 20)),
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.science),
+            title: const Text('Mesh Simulator'),
+            onTap: () => _fromDrawer(_showSimulator),
+          ),
+          ListTile(
+            leading: const Icon(Icons.hub),
+            title: const Text('Mesh Debug'),
+            onTap: () => _fromDrawer(_showDebug),
+          ),
+          ListTile(
+            leading: const Icon(Icons.campaign),
+            title: const Text('Broadcast'),
+            onTap: () => _fromDrawer(_showBroadcast),
+          ),
+          ListTile(
+            leading: const Icon(Icons.qr_code),
+            title: const Text('My QR Code'),
+            onTap: () => _fromDrawer(_showMyCode),
+          ),
+          ListTile(
+            leading: const Icon(Icons.qr_code_scanner),
+            title: const Text('Scan QR Code'),
+            onTap: () => _fromDrawer(_scanCode),
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.bug_report),
+            title: const Text('Error Log'),
+            onTap: () => _fromDrawer(_showErrorLog),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('MeshOS Console'),
-        actions: [
-          IconButton(icon: const Icon(Icons.science), onPressed: _showSimulator),
-          IconButton(icon: const Icon(Icons.hub), onPressed: _showDebug),
-          IconButton(icon: const Icon(Icons.campaign), onPressed: _showBroadcast),
-          IconButton(icon: const Icon(Icons.qr_code), onPressed: _showMyCode),
-          IconButton(icon: const Icon(Icons.qr_code_scanner), onPressed: _scanCode),
-        ],
-      ),
+      appBar: AppBar(title: const Text('MeshOS Console')),
+      drawer: _buildDrawer(),
       body: !_ready && _error == null
-          ? const Center(child: CircularProgressIndicator())
+          ? Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(),
+                    if (_slowStart) ...[
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Still starting -- this is taking longer than usual.',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      TextButton.icon(
+                        onPressed: _showErrorLog,
+                        icon: const Icon(Icons.bug_report),
+                        label: const Text('View error log'),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            )
           : _error != null
-              ? Center(child: Text('Failed to start: $_error'))
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text('Failed to start: $_error', textAlign: TextAlign.center),
+                        const SizedBox(height: 16),
+                        ElevatedButton.icon(
+                          onPressed: _showErrorLog,
+                          icon: const Icon(Icons.bug_report),
+                          label: const Text('View error log'),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
               : _buildBody(),
     );
   }
@@ -300,31 +510,43 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
-  final List<ChatMessageRecord> _messages = [];
 
   // File transfers are session-only (not persisted to ChatHistoryStore,
   // unlike text messages) -- a dev-harness scope decision, not a platform
-  // limitation; see ROADMAP.md Checkpoint 7's notes.
+  // limitation; see ROADMAP.md Checkpoint 7's notes. Unlike text
+  // messages, this screen still misses a file transfer that completes
+  // while it isn't open -- a known, narrower version of the same gap
+  // text messages used to have; see NEXT_STEPS.md.
   final List<_FileEvent> _fileEvents = [];
   final Map<String, _FileEvent> _outgoingTransfers = {};
 
-  Map<String, List<ChatMessageRecord>> _allHistory = {};
-  StreamSubscription<InboundMessage>? _messageSub;
+  StreamSubscription<Map<String, List<ChatMessageRecord>>>? _historySub;
   StreamSubscription<IncomingFile>? _fileSub;
   StreamSubscription<FileTransferProgress>? _progressSub;
 
   @override
   void initState() {
     super.initState();
-    _loadHistory();
-    _messageSub = widget.mesh.messages.listen(_onIncoming);
+    // widget.historyStore is already loaded and up to date by the time
+    // any ChatScreen can be opened (HomeScreen awaits its init() during
+    // bootstrap, before ChatScreen is reachable) -- messages() below
+    // reads it directly, no async load needed here. This subscription is
+    // just for live updates while the screen stays open, including for
+    // a message from this peer that HomeScreen's listener persists while
+    // this screen is the one on top.
+    _historySub = widget.historyStore.updates.listen((_) {
+      if (!mounted) return;
+      setState(() {});
+      _scrollToBottom();
+    });
     _fileSub = widget.mesh.incomingFiles.listen(_onIncomingFile);
     _progressSub = widget.mesh.outgoingFileProgress.listen(_onOutgoingProgress);
+    _scrollToBottom();
   }
 
   @override
   void dispose() {
-    _messageSub?.cancel();
+    _historySub?.cancel();
     _fileSub?.cancel();
     _progressSub?.cancel();
     _textController.dispose();
@@ -332,39 +554,7 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  Future<void> _loadHistory() async {
-    final history = await widget.historyStore.loadAll();
-    if (!mounted) return;
-    setState(() {
-      _allHistory = history;
-      _messages
-        ..clear()
-        ..addAll(history[widget.peerNodeId] ?? const []);
-    });
-    _scrollToBottom();
-  }
-
-  void _onIncoming(InboundMessage message) {
-    // senderNodeId is always populated, whether the message arrived
-    // directly or was routed through relays (Checkpoint 6) -- unlike
-    // remoteId, which is null for a routed message. A non-null topic
-    // means this is broadcast/publish traffic (Checkpoint 7), which
-    // belongs in BroadcastScreen's feed, not a private chat thread, even
-    // if it happens to come from this peer.
-    if (message.senderNodeId != widget.peerNodeId || message.topic != null) return;
-    setState(() {
-      _messages.add(
-        ChatMessageRecord(
-          outgoing: false,
-          text: utf8.decode(message.plaintext),
-          timestamp: DateTime.now(),
-          status: 'received',
-        ),
-      );
-    });
-    unawaited(_persist());
-    _scrollToBottom();
-  }
+  List<ChatMessageRecord> get _messages => widget.historyStore.forPeer(widget.peerNodeId);
 
   void _onIncomingFile(IncomingFile file) {
     if (file.senderNodeId != widget.peerNodeId) return;
@@ -407,11 +597,6 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
   }
 
-  Future<void> _persist() async {
-    _allHistory[widget.peerNodeId] = List.of(_messages);
-    await widget.historyStore.saveAll(_allHistory);
-  }
-
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
@@ -424,15 +609,20 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     _textController.clear();
 
-    final record = ChatMessageRecord(
-      outgoing: true,
-      text: text,
-      timestamp: DateTime.now(),
-      status: 'sending',
+    final id = newChatMessageId();
+    await widget.historyStore.add(
+      widget.peerNodeId,
+      ChatMessageRecord(
+        id: id,
+        outgoing: true,
+        text: text,
+        timestamp: DateTime.now(),
+        status: 'sending',
+      ),
     );
-    final index = _messages.length;
-    setState(() => _messages.add(record));
-    unawaited(_persist());
+    // widget.historyStore.updates (subscribed in initState) drives the
+    // rebuild once the write above lands -- no local setState needed
+    // here or in the status update below.
     _scrollToBottom();
 
     try {
@@ -440,17 +630,14 @@ class _ChatScreenState extends State<ChatScreen> {
         destination: widget.peerNodeId,
         payload: utf8.encode(text),
       );
-      if (!mounted) return;
-      setState(() {
-        _messages[index] = record.copyWith(
-          status: status == DeliveryStatus.delivered ? 'delivered' : 'failed',
-        );
-      });
+      await widget.historyStore.updateStatus(
+        widget.peerNodeId,
+        id,
+        status == DeliveryStatus.delivered ? 'delivered' : 'failed',
+      );
     } catch (e) {
-      if (!mounted) return;
-      setState(() => _messages[index] = record.copyWith(status: 'failed'));
+      await widget.historyStore.updateStatus(widget.peerNodeId, id, 'failed');
     }
-    unawaited(_persist());
   }
 
   @override

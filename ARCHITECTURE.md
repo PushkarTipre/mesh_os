@@ -252,9 +252,13 @@ await mesh.trustFromIdentityCard(scannedPayload);        // verifies + trusts in
 
 mesh.stats;                     // snapshot: packets/bytes sent/received/relayed, sessions, ...
 mesh.statsUpdates.listen((stats) => ...);
+
+mesh.diagnostics.listen((step) => ...);  // step-by-step start() progress, for on-device debugging
 ```
 
 `initialize`, `start`, `send`, `devices`, `deviceUpdates`, and `messages` are implemented as of Checkpoint 4 (`packages/mesh_os/lib/src/mesh_os.dart`), backed by `mesh_core`'s `MeshLink` (handshake, crypto, ACK/retry) and a `Transport` implementation (`mesh_transport_nearby`, Checkpoint 3). `trust`/`block`/`unblock`/`createIdentityCard`/`trustFromIdentityCard` are implemented as of Checkpoint 5, backed by `mesh_core`'s `TrustStore`/`IdentityCard` and `mesh_os`'s SQLite-backed `DriftTrustStore` (§9). As of Checkpoint 6, `send` transparently routes through relays (`MeshLink.sendToNode`, §7) when the destination isn't a direct neighbor -- callers never chose "direct" vs "routed" and don't need to. As of Checkpoint 7, `broadcast`/`publish`/`subscribe`/`unsubscribe`/`sendFile`/`outgoingFileProgress`/`incomingFiles` are implemented, thin wrappers over `mesh_core`'s `MeshLink` broadcast/pub-sub methods and `FileTransferManager` (§7). `messages` now filters out file-transfer chunks (`InboundMessage.isFileChunk`) before surfacing to the app -- use `incomingFiles` for those instead. As of Checkpoint 8, the `Transport` `start()` constructs is `MultiTransport([NearbyTransport(), BleTransport()])` (§7) instead of `NearbyTransport` alone -- transparent to every method above, none of their signatures or behavior changed. As of Checkpoint 9, `stats`/`statsUpdates` are implemented, a thin wrapper over `mesh_core`'s `MeshLink.stats`/`statsUpdates` (§7).
+
+**`diagnostics`** (post-Checkpoint 9): emits one string per named step inside `start()` (identity load, transport construction, transport start, discovery start, ...) and, on failure, the exception before rethrowing. Exists because `start()` failing or hanging on a real device otherwise produces nothing actionable -- no debugger, no logcat access for most users. `mesh_console`'s `HomeScreen` subscribes before calling `start()` and feeds every event into its own persistent `AppLog` (`apps/mesh_console/lib/app_log.dart`), viewable on-device via the "Error Log" drawer entry (`error_log_screen.dart`) without needing `adb` or a computer. `HomeScreen` additionally wraps `start()` in a 45-second timeout so a hang surfaces as a visible error instead of leaving the UI on an indefinite spinner -- the state most likely to get an app killed by an OS-level ANR watchdog before anything useful reaches the log.
 
 ---
 

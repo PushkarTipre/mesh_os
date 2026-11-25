@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:permission_handler/permission_handler.dart';
 
 /// The Android runtime permissions Nearby Connections needs. Must be
@@ -16,10 +18,17 @@ class NearbyPermissions {
   ];
 
   /// Requests every permission above and returns true only if all of them
-  /// were granted.
+  /// were granted. Bounded by a generous timeout, same defensive reason
+  /// as `BlePermissions._authorize`: an Android permission-result
+  /// callback can in principle never fire, and a caller awaiting this
+  /// with no timeout of its own would then hang forever.
   static Future<bool> requestAll() async {
-    final statuses = await required.request();
-    return statuses.values.every((status) => status.isGranted);
+    try {
+      final statuses = await required.request().timeout(const Duration(seconds: 60));
+      return statuses.values.every((status) => status.isGranted);
+    } catch (_) {
+      return false;
+    }
   }
 
   static Future<bool> allGranted() async {

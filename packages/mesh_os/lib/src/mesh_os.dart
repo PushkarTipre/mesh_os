@@ -70,6 +70,10 @@ class MeshOS {
   StreamSubscription<InboundMessage>? _messageSub;
   StreamSubscription<List<Contact>>? _contactSub;
 
+  final StreamController<String> _diagnostics = StreamController<String>.broadcast();
+
+  void _diag(String message) => _diagnostics.add(message);
+
   /// This node's permanent, stable identity. Only valid after [initialize].
   NodeIdentity get identity {
     final id = _identity;
@@ -134,6 +138,18 @@ class MeshOS {
     return link.statsUpdates;
   }
 
+  /// Coarse, human-readable step-by-step progress messages for [start] --
+  /// "requesting Nearby permissions", "BLE permissions granted", "starting
+  /// discovery", and so on. Not meant for protocol-level debugging (see
+  /// `MeshLink.statsUpdates`/[stats] for that) -- this exists specifically
+  /// so a host app can show *where* startup is stuck if it never
+  /// completes, since permission dialogs and radio initialization are
+  /// exactly the kind of platform-specific step that can hang or fail
+  /// silently on some devices without ever throwing a catchable
+  /// exception. `mesh_console`'s error-log screen is built entirely on
+  /// this stream.
+  Stream<String> get diagnostics => _diagnostics.stream;
+
   /// Every contact this device has ever interacted with, regardless of
   /// whether they're currently nearby (ARCHITECTURE.md §4, §9).
   Future<List<Contact>> get contacts => _trustStore.listContacts();
@@ -148,41 +164,127 @@ class MeshOS {
   }
 
   /// Starts advertising and discovering over the available transports,
-  /// and begins auto-connecting to every MeshOS peer found.
+  /// and begins auto-connecting to every MeshOS peer found. Emits
+  /// progress on [diagnostics] as it goes; if it throws, the last
+  /// diagnostic emitted (with no matching "...done" message after it)
+  /// tells you which step failed.
   Future<void> start() async {
     if (_started) return;
     _started = true;
 
-    await NearbyPermissions.requestAll();
-    await BlePermissions.requestAll();
+    try {
+      // Run both permission requests concurrently rather than one after
+      // the other -- Android queues/serializes the actual dialogs at the
+      // OS level regardless, so this is safe, and it roughly halves
+      // worst-case wall time. Matters in practice: on at least one real
+      // device (a OnePlus Nord), BLE's authorize() calls alone take up
+      // to 20s to time out (see BlePermissions), and stacking that after
+      // Nearby's own multi-permission dialog was enough to make a
+      // perfectly-successful startup look, from the host app's
+      // perspective, like it was taking unreasonably long.
+      _diag('Requesting Nearby + BLE permissions...');
+      final granted = await Future.wait([
+        NearbyPermissions.requestAll(),
+        BlePermissions.requestAll(),
+      ]);
+      final nearbyGranted = granted[0];
+      final bleGranted = granted[1];
+      _diag('Nearby permissions: granted=$nearbyGranted');
+      _diag('BLE permissions: granted=$bleGranted');
 
-    // Nearby listed first: MultiTransport.connect prefers earlier
-    // entries, and Nearby has the higher bandwidth ceiling of the two
-    // (ARCHITECTURE.md §11). BLE is what still works on devices without
-    // Google Play services, or if Nearby is unavailable for any reason.
-    final transport = MultiTransport([NearbyTransport(), BleTransport()]);
-    final link = MeshLink(transport: transport, identity: identity, trustStore: _trustStore)
-      ..start();
-    _transport = transport;
-    _link = link;
-    _fileTransfers = FileTransferManager(link: link);
+      // Nearby listed first: MultiTransport.connect prefers earlier
+      // entries, and Nearby has the higher bandwidth ceiling of the two
+      // (ARCHITECTURE.md §11). BLE is what still works on devices without
+      // Google Play services, or if Nearby is unavailable for any reason.
+      //
+      // BleTransport is only included if BLE permissions actually came
+      // back granted. Without that, its central-manager scan runs without
+      // the OS having authorized it -- observed on at least one real
+      // device (a OnePlus Nord) to silently drop its service-UUID filter,
+      // surfacing every BLE peripheral in range (headphones, laptops, ...)
+      // as if it were a MeshOS peer. `_onDeviceEvent` below auto-connects
+      // to everything it sees, so each of those becomes a real GATT
+      // connection attempt to a device that was never going to have our
+      // service, which fails and disconnects -- churn that can leave the
+      // phone's Bluetooth stack unstable for Nearby too, since Nearby's
+      // discovery also rides on BLE under the hood. Simplest correct fix:
+      // don't drive the radio at all without authorization for it.
+      _diag('Constructing transports...');
+      final transports = <Transport>[NearbyTransport()];
+      if (bleGranted) {
+        transports.add(BleTransport());
+      } else {
+        _diag('BLE not authorized -- running Nearby-only this session');
+      }
+      final transport = MultiTransport(transports);
+      final link = MeshLink(transport: transport, identity: identity, trustStore: _trustStore)
+        ..start();
+      _transport = transport;
+      _link = link;
+      _fileTransfers = FileTransferManager(link: link);
+      _diag('MeshLink constructed and started');
 
-    _deviceSub = transport.deviceEvents.listen(_onDeviceEvent);
-    _connectionSub = transport.connectionEvents.listen(_onConnectionEvent);
-    _sessionSub = link.sessionEstablished.listen(_onSessionEstablished);
-    // File-transfer chunks are internal plumbing (FileTransferManager
-    // already consumed them above) -- an app listening on [messages]
-    // wants chat/broadcast traffic, not raw chunk bytes. See
-    // [incomingFiles] for reassembled files instead.
-    _messageSub = link.messages.listen((message) {
-      if (message.isFileChunk) return;
-      _messagesController.add(message);
-    });
-    _contactSub = _trustStore.watchContacts().listen(_onContactsChanged);
+      _deviceSub = transport.deviceEvents.listen(_onDeviceEvent);
+      _connectionSub = transport.connectionEvents.listen(_onConnectionEvent);
+      _sessionSub = link.sessionEstablished.listen(_onSessionEstablished);
+      // File-transfer chunks are internal plumbing (FileTransferManager
+      // already consumed them above) -- an app listening on [messages]
+      // wants chat/broadcast traffic, not raw chunk bytes. See
+      // [incomingFiles] for reassembled files instead.
+      _messageSub = link.messages.listen((message) {
+        if (message.isFileChunk) return;
+        _messagesController.add(message);
+      });
+      _contactSub = _trustStore.watchContacts().listen(_onContactsChanged);
 
-    final tempId = await identity.temporaryId();
-    await transport.startAdvertising(localId: tempId);
-    await transport.startDiscovery(localId: tempId);
+      final tempId = await identity.temporaryId();
+      _diag('Starting advertising...');
+      await transport.startAdvertising(localId: tempId);
+      _diag('Advertising started; starting discovery...');
+      await transport.startDiscovery(localId: tempId);
+      _diag('start() complete');
+    } catch (e, stack) {
+      _diag('start() failed: $e\n$stack');
+      rethrow;
+    }
+  }
+
+  /// Restarts advertising and discovery on the current transport(s).
+  /// A no-op if [start] hasn't completed yet.
+  ///
+  /// Exists specifically for a host app to call when it returns to the
+  /// foreground after being backgrounded. Neither Nearby Connections nor
+  /// BLE scanning/advertising reliably keeps running while an app is
+  /// backgrounded (most aggressively once the screen is off -- Android
+  /// throttles or fully suspends both for apps that aren't foregrounded),
+  /// and nothing automatically resumes them just because the app becomes
+  /// visible again -- observed on real devices as two phones sitting next
+  /// to each other, both freshly resumed from background, showing each
+  /// other as "not nearby" indefinitely. `mesh_console`'s `HomeScreen`
+  /// calls this from a `WidgetsBindingObserver` on
+  /// `AppLifecycleState.resumed`. See NEXT_STEPS.md.
+  ///
+  /// Also clears the internal "already attempted a connection to this
+  /// peer" tracking, so a peer re-found by the fresh discovery below gets
+  /// a genuine reconnect attempt even if it was marked as already
+  /// attempted before backgrounding suspended everything (and therefore
+  /// never got a chance to fire a `disconnected` event to clear that
+  /// marker the normal way).
+  Future<void> refreshDiscovery() async {
+    final transport = _transport;
+    if (transport == null) return;
+    _diag('Refreshing discovery (app resumed)...');
+    try {
+      final tempId = await identity.temporaryId();
+      await transport.stopDiscovery();
+      await transport.stopAdvertising();
+      _connectAttempted.clear();
+      await transport.startAdvertising(localId: tempId);
+      await transport.startDiscovery(localId: tempId);
+      _diag('Discovery refreshed');
+    } catch (e, stack) {
+      _diag('Discovery refresh failed: $e\n$stack');
+    }
   }
 
   void _onDeviceEvent(DeviceEvent event) {
@@ -451,5 +553,6 @@ class MeshOS {
     await _transport?.dispose();
     await _devicesController.close();
     await _messagesController.close();
+    await _diagnostics.close();
   }
 }

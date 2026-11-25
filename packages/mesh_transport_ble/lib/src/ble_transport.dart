@@ -194,8 +194,12 @@ class BleTransport implements Transport {
       _connectionEvents.add(ConnectionEvent(remoteId: remoteId, type: ConnectionEventType.connected));
     } catch (_) {
       // Not a real MeshOS GATT service, or discovery/setup failed --
-      // don't leave a half-open link around.
-      unawaited(_central.disconnect(event.peripheral));
+      // don't leave a half-open link around. Best-effort: the peripheral
+      // may already be gone/disconnected at the radio level by now (e.g.
+      // status-22-style native errors from the underlying stack), which
+      // isn't a condition this transport needs to surface -- we already
+      // report the connection attempt itself as failed below.
+      unawaited(_central.disconnect(event.peripheral).catchError((_) {}));
       _connectionEvents.add(ConnectionEvent(remoteId: remoteId, type: ConnectionEventType.failed));
     }
   }
@@ -251,7 +255,7 @@ class BleTransport implements Transport {
         DataEvent(remoteId: event.central.uuid.toString(), data: event.request.value),
       );
     }
-    unawaited(_peripheral.respondWriteRequest(event.request));
+    unawaited(_peripheral.respondWriteRequest(event.request).catchError((_) {}));
   }
 
   void _onCharacteristicReadRequested(GATTCharacteristicReadRequestedEventArgs event) {
@@ -259,7 +263,9 @@ class BleTransport implements Transport {
     // exists only for GATT stacks that expect it on a notify
     // characteristic. Answer defensively so a stray read request never
     // leaves a central's GATT operation queue hanging.
-    unawaited(_peripheral.respondReadRequestWithValue(event.request, value: Uint8List(0)));
+    unawaited(
+      _peripheral.respondReadRequestWithValue(event.request, value: Uint8List(0)).catchError((_) {}),
+    );
   }
 
   @override

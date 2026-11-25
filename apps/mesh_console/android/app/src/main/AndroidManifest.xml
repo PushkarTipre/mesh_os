@@ -1,10 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Nearby Connections transport (mesh_transport_nearby, CP3) --
+    <!-- Nearby Connections transport (mesh_transport_nearby, CP3),
          ARCHITECTURE.md §11. Runtime permission requests are handled by
          NearbyPermissions; these declarations are what make those
          requests possible at all. -->
 
-    <!-- Android 12+ (API 31+) Bluetooth permissions -- also cover
+    <!-- Android 12+ (API 31+) Bluetooth permissions; also cover
          mesh_transport_ble (CP8, BlePermissions): the plugin's own
          manifest declares nothing itself and relies entirely on the
          host app for these. -->
@@ -32,13 +32,13 @@
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
 
     <!-- Nearby Connections upgrades connections to Wi-Fi Direct/hotspot
-         for bandwidth -- local networking only, no internet uplink
+         for bandwidth: local networking only, no internet uplink
          required (MeshOS is offline-first, ARCHITECTURE.md §2) -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- QR-code identity exchange (CP5, mobile_scanner) -- ARCHITECTURE.md §9 -->
+    <!-- QR-code identity exchange (CP5, mobile_scanner), ARCHITECTURE.md §9 -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
